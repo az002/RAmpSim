@@ -1,10 +1,10 @@
 use rustc_hash::{FxHashMap, FxHashSet};
+use rayon::prelude::*;
+use crossbeam::queue::ArrayQueue;
 use seq_io::fasta::{Reader, Record};
+use bio::alignment::pairwise::*;
 use wyhash::WyHash;
-use std::any;
 use std::hash::{Hash, Hasher};
-use std::fs::File;
-use std::io::{BufWriter, BufReader, prelude::*};
 
 static BYTE2BITS: [u8; 256] = {
     let mut l = [0u8; 256];
@@ -25,7 +25,7 @@ fn hash(seed: u64, kmer: u128) -> u64 {
     h.finish()
 }
 
-fn sketch<T: AsRef<[u8]>>(seq: T, k: usize) -> FxHashMap<u64,Vec<usize>> {
+fn sketch<T: AsRef<[u8]>>(seq: &T, k: usize) -> FxHashMap<u64,Vec<usize>> {
     let mut sketch: FxHashMap<u64,Vec<usize>> = FxHashMap::default();
     let mask : u128 = (1 << 2*k) - 1;
     let seq = seq.as_ref();
@@ -44,36 +44,67 @@ fn sketch<T: AsRef<[u8]>>(seq: T, k: usize) -> FxHashMap<u64,Vec<usize>> {
 }
 
 fn main() {
-    let k: usize = 15;
+    let _k: usize = 12;
+    let _w: usize = 138;
     let ref_path = "/usr1/aidanz/projects/read_sim/data/fasta/U00096.3.fasta";
     let mut ref_reader = Reader::from_path(ref_path).unwrap();
     let ref_record = ref_reader.next().expect("Failed to read reference record").unwrap();
-    let ref_sketch = sketch(ref_record.owned_seq(), k);
+    let ref_seq = ref_record.owned_seq();
+    let ref_sketch = sketch(&ref_seq, _k);
 
 
     let probe_path = "/usr1/aidanz/projects/read_sim/data/fasta/all_probes.fa";
     let mut probe_reader = Reader::from_path(probe_path).unwrap();
-    let mut probe_sketches : Vec<FxHashMap<u64,Vec<usize>>> = Vec::new();
+    let mut probe_sketches : Vec<(Vec<u8>,FxHashMap<u64,Vec<usize>>)> = Vec::new();
 
     println!("Reading probes");
     while let Some(record) = probe_reader.next() {
         let record = record.expect("Error reading record");
         let seq = record.owned_seq();
-        probe_sketches.push(sketch(seq, k));
+        probe_sketches.push((seq.clone(),sketch(&seq, _k)));
     }
+    println!("Finished reading probes");
 
-    let mut count = 0;
-    for sk in probe_sketches.iter() {
-        let mut matches = 0;
+    let score = |a: u8, b: u8| if a == b { 2i32 } else { -2i32 };
+
+    let mut pileup : FxHashMap<usize,i32> = FxHashMap::default();
+
+    let q : ArrayQueue<(usize,usize,usize)> = ArrayQueue::new(probe_sketches.len());
+
+    (0..probe_sketches.len()).into_par_iter().for_each(|i| {
+        println!("Processing probe {}", i);
+        let mut aligner = Aligner::new(-4,-1,&score);
+        let sk = &probe_sketches[i].1;
+        let seq = &probe_sketches[i].0;
         for hash_key in sk.keys() {
-            if ref_sketch.contains_key(hash_key) {
-                matches += 1;
+            match ref_sketch.get(hash_key) {
+                Some(ref_positions) => {
+                    for ref_pos in ref_positions {
+                        let ref_start = ref_pos.saturating_sub(_w);
+                        let ref_end = (*ref_pos + _w).min(ref_seq.len());
+                        let ref_window = &ref_seq[ref_start..ref_end];                         
+                        let alignment = aligner.semiglobal(&seq, &ref_window);
+                        if alignment.score >= 80 {
+                            let _ = q.push((i,
+                                    alignment.ystart as usize + ref_start,
+                                    alignment.ylen as usize));
+                        }
+                    }
+                },
+                None => {}
             }
         }
-        if matches > 0 {
-            println!("Found {} matching k-mers", matches);
-            count += 1;
+    });
+
+    let probe_hits : FxHashSet<(usize,usize,usize)> = FxHashSet::from_iter(q.into_iter());
+
+    for hit in probe_hits.iter() {
+        println!("Probe {} hit at position {} with length {}", hit.0, hit.1, hit.2);
+        for i in hit.1..hit.2+hit.1 {
+            *pileup.entry(i).or_insert(0) += 1;
         }
     }
-    println!("Found {} probes with matching k-mers", count);
+    let pileup_count = pileup.len();
+    println!("Number of positions with at least one hit: {}", pileup_count);
+    println!("Number of probes with at least one hit: {}", probe_hits.len());
 }
