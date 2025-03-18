@@ -1,3 +1,4 @@
+#[allow(unused_imports)]
 use rustc_hash::{FxHashMap, FxHashSet};
 use rayon::prelude::*;
 use crossbeam::queue::ArrayQueue;
@@ -5,6 +6,9 @@ use seq_io::fasta::{Reader, Record};
 use bio::alignment::pairwise::*;
 use wyhash::WyHash;
 use std::hash::{Hash, Hasher};
+
+pub mod utils;
+use utils::align::aligner;
 
 static BYTE2BITS: [u8; 256] = {
     let mut l = [0u8; 256];
@@ -43,8 +47,9 @@ fn sketch<T: AsRef<[u8]>>(seq: &T, k: usize) -> FxHashMap<u64,Vec<usize>> {
     return sketch;
 }
 
+#[allow(dead_code)]
 fn main() {
-    let _k: usize = 12;
+    let _k: usize = 15;
     let _w: usize = 138;
     let ref_path = "/usr1/aidanz/projects/read_sim/data/fasta/U00096.3.fasta";
     let mut ref_reader = Reader::from_path(ref_path).unwrap();
@@ -74,6 +79,7 @@ fn main() {
     (0..probe_sketches.len()).into_par_iter().for_each(|i| {
         println!("Processing probe {}", i);
         let mut aligner = Aligner::new(-4,-1,&score);
+        //let mut aligner = aligner::new(0,0,-3,-1,2,-2);
         let sk = &probe_sketches[i].1;
         let seq = &probe_sketches[i].0;
         for hash_key in sk.keys() {
