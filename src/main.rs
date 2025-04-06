@@ -1,13 +1,14 @@
 use bam::SamReader;
 use bam::Record as BamRecord;
-#[allow(unused_imports)]
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use seq_io::fasta::{Reader, Record};
 use std::cmp::min;
 use rand_distr::{Poisson,Distribution};
 use rand::Rng;
+
+mod utils;
+use utils::sim::*;
 
 #[allow(unused)]
 
@@ -66,6 +67,16 @@ fn main() {
     let read_len = 8000;
     let bucket_size = 1000;
 
+    // let mut simulation = Simulation::new(
+    //     read_len,
+    //     bucket_size,
+    //     &mut ref_reader,
+    //     &mut samreader,
+    //     &mut output_writer
+    // );
+
+    // simulation.simulate();
+
     let mut cur_aln = BamRecord::new();
     read_next(&mut samreader, &mut cur_aln);
 
@@ -104,7 +115,7 @@ fn main() {
             }
 
             nreads = generate_reads(&mut output_writer, read_len, cur_count, seq, cur_bucket_start, cur_bucket_end, nreads, cur_genome);
-            println!("Generated {} reads for genome {} bucket start: {}, bucket end: {}", cur_count, genome_ind, cur_bucket_start, cur_bucket_end);
+            //println!("Generated {} reads for genome {} bucket start: {}, bucket end: {}", cur_count, genome_ind, cur_bucket_start, cur_bucket_end);
             cur_bucket_start = cur_aln_start;
             cur_bucket_end = min(cur_bucket_start + bucket_size - 1, seq.len()-1);
             cur_count = 0;
