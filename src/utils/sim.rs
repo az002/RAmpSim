@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufRead, BufWriter, Write};
+use std::io::BufWriter;
 use std::io::BufReader;
 use bam::SamReader;
 use bam::Record as BamRecord;
@@ -56,23 +56,19 @@ impl Simulator {
     pub fn generate_reads(
         &mut self,
         output_writer: &mut BufWriter<File>,
-        read_len: usize,
         score: usize,
         seq: &[u8],
-        cur_bucket_start: usize,
-        cur_bucket_end: usize,
-        nreads: usize,
         cur_genome: &[u8],
-    ) -> usize {
+    ) {
         let poisson = Poisson::new(score as f64).unwrap();
         let s = poisson.sample(&mut rand::rng());
         println!(
             "Generating {} reads for bucket {} to {} containing {} reads in genome {}",
-            s, cur_bucket_start, cur_bucket_end, score, str::from_utf8(cur_genome).unwrap()
+            s, self.cur_bucket_start, self.cur_bucket_end, score, str::from_utf8(cur_genome).unwrap()
         );
-        let bucket_size = cur_bucket_end - cur_bucket_start + 1;
-        let valid_start = cur_bucket_start.saturating_sub(read_len-bucket_size);
-        let valid_end = cur_bucket_start;
+        let bucket_size = self.cur_bucket_end - self.cur_bucket_start + 1;
+        let valid_start = self.cur_bucket_start.saturating_sub(self.read_len-bucket_size);
+        let valid_end = self.cur_bucket_start;
 
         // Generate reads if we have a valid range
         if valid_start < valid_end {
@@ -80,19 +76,19 @@ impl Simulator {
             for i in 0..s as usize {
                 // Generate a random starting position
                 let start_pos = rng.random_range(valid_start..=valid_end);
-                let end_pos = min(start_pos + read_len, seq.len());
+                let end_pos = min(start_pos + self.read_len, seq.len());
                 
                 // Extract the read from the sequence
                 let read = &seq[start_pos..end_pos];
                 // Write the read to the output file
-                let id = format!("read_{}_{}_{}_{}", nreads+i, str::from_utf8(cur_genome).unwrap(), start_pos, end_pos);
+                let id = format!("read_{}_{}_{}_{}", self.nreads+i, str::from_utf8(cur_genome).unwrap(), start_pos, end_pos);
                 let _ = seq_io::fasta::write_parts(&mut *output_writer, id.as_bytes(), None, read);
                 
                 // Do something with the read (save to file, store in collection, etc.)
                 //println!("Generated read at position {}", start_pos+cur_start);
             }
         }
-        nreads + (s as usize)
+        self.nreads += s as usize;
     }
 
 }
@@ -138,13 +134,13 @@ impl<'a> Simulation<'a> {
             if self.sim.aln.ref_id() != genome_ind {
                 continue;
             }
-            let mut cur_bucket_end = min(self.sim.cur_bucket_start + self.sim.bucket_size - 1, seq.len()-1);
+            self.sim.cur_bucket_end = min(self.sim.cur_bucket_start + self.sim.bucket_size - 1, seq.len()-1);
             loop {
-                if genome_ind == self.sim.aln.ref_id() && self.sim.cur_aln_start <= cur_bucket_end {
+                if genome_ind == self.sim.aln.ref_id() && self.sim.cur_aln_start <= self.sim.cur_bucket_end {
                     self.sim.cur_count += 1;
                     if self.sim.get_next_read(self.samreader) {
                         self.sim.end_reached = true;
-                        let _ = self.sim.generate_reads(self.output_writer, self.sim.read_len, self.sim.cur_count, seq, self.sim.cur_bucket_start, cur_bucket_end, self.sim.nreads, cur_genome);
+                        self.sim.generate_reads(self.output_writer, self.sim.cur_count, seq, cur_genome);
                         break;
                     }
 
@@ -152,9 +148,9 @@ impl<'a> Simulation<'a> {
                     continue;
                 }
 
-                let _ = self.sim.generate_reads(self.output_writer, self.sim.read_len, self.sim.cur_count, seq, self.sim.cur_bucket_start, cur_bucket_end, self.sim.nreads, cur_genome);
+                self.sim.generate_reads(self.output_writer, self.sim.cur_count, seq, cur_genome);
                 self.sim.cur_bucket_start = self.sim.cur_aln_start;
-                cur_bucket_end = min(self.sim.cur_bucket_start + self.sim.bucket_size - 1, seq.len()-1);
+                self.sim.cur_bucket_end = min(self.sim.cur_bucket_start + self.sim.bucket_size - 1, seq.len()-1);
                 self.sim.cur_count = 0;
                 if self.sim.aln.ref_id() != genome_ind { break; }
             }
