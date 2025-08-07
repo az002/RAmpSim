@@ -21,10 +21,13 @@ struct Args {
     sam_path: std::path::PathBuf,
 
     #[arg(short='l', long, default_value_t = 8000)]
-    read_len: usize,
+    fragment_len: usize,
 
     #[arg(short, long, default_value_t = 1000)]
-    bucket_size: usize
+    bucket_size: usize,
+
+    #[arg(short, long, action)]
+    use_energy: bool
 }
 
 fn main() {
@@ -32,8 +35,9 @@ fn main() {
     println!("ref_path: {:?}", args.ref_path);
     println!("out_path: {:?}", args.out_path);
     println!("sam_path: {:?}", args.sam_path);
-    println!("read_len: {:?}", args.read_len);
+    println!("fragment_len: {:?}", args.fragment_len);
     println!("bucket_size: {:?}", args.bucket_size);
+    println!("use_energy: {:?}", args.use_energy);
     // let path = "/usr1/aidanz/projects/read_sim/data/alignments/sorted_mock_alignments.sam";
     let mut samreader = SamReader::from_path(args.sam_path).unwrap();
 
@@ -48,12 +52,16 @@ fn main() {
     // let bucket_size = 1000;
 
     let mut simulation = Simulation::new(
-        args.read_len,
+        args.fragment_len,
         args.bucket_size,
+        args.use_energy,
         &mut ref_reader,
         &mut samreader,
         &mut output_writer
     );
+
+    // simulation.sim.score_aln();
+
 
     simulation.simulate();
 }
