@@ -1,16 +1,15 @@
-use std::fs::File;
-use std::io::BufWriter;
-use std::io::BufReader;
-use bam::SamReader;
+use std::collections::{VecDeque, HashMap};
 use bam::Record as BamRecord;
+use rand_distr::{Poisson,LogNormal,Distribution};
+use rand::Rng;
+use std::fs::File;
+use std::io::{BufWriter, BufReader};
+use bam::SamReader;
 use nalgebra::ArrayStorage;
 use nalgebra::SVector;
 use seq_io::fasta::{Reader, Record};
-use std::cmp::min;
-use rand_distr::{Poisson,Distribution};
-use rand::Rng;
-use std::collections::HashMap;
-use lazy_static::lazy_static;
+use std::cmp;
+use std::io::Write;
 
 static BYTE2BITS: [u8; 256] = {
     let mut l = [0u8; 256];
@@ -24,27 +23,40 @@ static BYTE2BITS: [u8; 256] = {
     l[b't' as usize] = 0b11;
     l
 };
+#[inline]
+fn nt2bits(b: u8) -> u8 { BYTE2BITS[b as usize] }
 
-lazy_static! {
-    static ref TRIMER_INDEX: HashMap<u8, usize> = HashMap::from([
-        (0, 0), (63, 0), (1, 1), (47, 1),
-        (2, 2), (31, 2), (3, 3), (15, 3),
-        (4, 4), (59, 4), (5, 5), (43, 5),
-        (6, 6), (27, 6), (7, 7), (11, 7),
-        (8, 8), (55, 8), (9, 9), (39, 9),
-        (10, 10), (23, 10), (12, 11), (51, 11),
-        (13, 12), (35, 12), (14, 13), (19, 13),
-        (16, 14), (62, 14), (17, 15), (46, 15),
-        (18, 16), (30, 16), (20, 17), (58, 17),
-        (21, 18), (42, 18), (22, 19), (26, 19),
-        (24, 20), (54, 20), (25, 21), (38, 21),
-        (28, 22), (50, 22), (29, 23), (34, 23),
-        (32, 24), (61, 24), (33, 25), (45, 25),
-        (36, 26), (57, 26), (37, 27), (41, 27),
-        (40, 28), (53, 28), (44, 29), (49, 29),
-        (48, 30), (60, 30), (52, 31), (56, 31),
-    ]);
+#[inline]
+const fn comp2(x: u8) -> u8 { x ^ 0b11 } // A<->T, C<->G on 2-bit alphabet
+
+#[inline]
+const fn revcomp3(k: u8) -> u8 {
+    let a = comp2((k >> 4) & 0b11);
+    let b = comp2((k >> 2) & 0b11);
+    let c = comp2(k & 0b11);
+    (c << 4) | (b << 2) | a
 }
+
+const fn build_trimer_index() -> [u8; 64] {
+	let mut map = [u8::MAX; 64];
+    let mut next = 0u8;
+    let mut k = 0u8;
+    while k < 64 {
+        let c = {
+            let rc = revcomp3(k);
+            if rc < k { rc } else { k }
+        };
+        if map[c as usize] == u8::MAX {
+            map[c as usize] = next;
+            next += 1;
+        }
+        map[k as usize] = map[c as usize];
+        k += 1;
+    }
+    map
+}
+
+const TRIMER_INDEX: [u8; 64] = build_trimer_index();
 
 const SCORE : SVector<f64, 32> = SVector::<f64,32>::from_array_storage(ArrayStorage([[-1.0333523772924682,  -1.458111012202453,  -1.035949547554549,  -0.7124736682600892, 
     -1.8355462789826653,  -3.2816907774428596,  -2.9387615700865912,  -2.4322581762379056, 
@@ -55,195 +67,365 @@ const SCORE : SVector<f64, 32> = SVector::<f64,32>::from_array_storage(ArrayStor
     -2.617678120625974,  -1.5216318279285466e-24,  -0.8229383115364808,  -2.1347399492841697, 
     -1.502770970281663e-38,  -0.8507439536421594,  -0.31680823162220356,  -0.06611591220578053]]));
 
-pub struct Simulator {
-    fragment_len : usize,
-    bucket_size : usize,
-    use_energy: bool,
-    pub aln : BamRecord,
-    cur_aln_start : usize,
-    cur_bucket_start : usize,
-    cur_bucket_end : usize,
-    cur_count : usize,
-    cur_score: f64,
-    end_reached : bool,
-    nreads : usize
+
+pub trait ProbeTrait {
+	fn score(&self) -> f64;
 }
 
-impl Simulator {
-    pub fn new(fragment_len: usize, bucket_size: usize, use_energy: bool) -> Simulator {
-        Simulator {
-            fragment_len,
-            bucket_size,
-            use_energy,
-            aln: BamRecord::new(),
-            cur_aln_start: 0,
-            cur_bucket_start: 0,
-            cur_bucket_end: 0,
-            cur_count: 0,
-            cur_score: 0.,
-            end_reached: false,
-            nreads: 0
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Probe {
+	pub pos_start: usize,
+    pub pos_end: usize,
+	pub score: f64,
+}
+
+impl ProbeTrait for Probe {
+	fn score(&self) -> f64 { self.score }
+}
+
+pub struct SequenceInput {
+	pub samreader: SamReader<BufReader<File>>,
+	pub ref_reader: Reader<File>,
+	pub output_writer: BufWriter<File>,
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct Window<T> {
+	pub probes : VecDeque<T>,
+	center : usize,
+	score: f64,
+	genome_ind: usize,
+}
+impl<T: ProbeTrait> Window<T> {
+
+	pub fn get_center(&self) -> Option<&T> { 
+		self.probes.get(self.center) 
+	}
+
+	pub fn len(&self) -> usize { self.probes.len()}
+
+	pub fn push_back(&mut self, item: T) {
+		self.score += item.score();
+		self.probes.push_back(item);
+	}
+
+	pub fn is_empty(&self) -> bool { self.probes.is_empty() }
+
+	pub fn pop_front(&mut self) -> Option<T> {
+		if self.center > 0 {
+			self.center -= 1;
+		}
+		let popped = self.probes.pop_front();
+		if popped.is_some() {
+			self.score -= popped.as_ref().unwrap().score();
+		}
+		popped
+	}
+
+	pub fn front(&self) -> Option<&T> { self.probes.front() }
+
+	pub fn back(&self) -> Option<&T> { self.probes.back() }
+
+	pub fn set_center(&mut self, index: usize) {
+		if index < self.probes.len() {
+			self.center = index;
+		} else {
+			panic!("Index out of bounds for setting center in Window");
+		}
+	}
+
+	pub fn clear(&mut self) {
+		self.probes.clear();
+		self.center = 0;
+		self.score = 0.0;
+	}
+}
+pub struct Simulator<'a> {
+    fragment_len: usize,
+	nfragments: usize,
+    use_energy:bool,
+	seqinput: &'a mut SequenceInput,
+    pub cur_aln: Option<BamRecord>,
+    cur_window: Window<Probe>,
+    cur_probe: Probe,
+	end_reached: bool,
+	probe_multiplicities: &'a HashMap<String, usize>,
+	vec_windows: Vec<Window<Probe>>,
+}
+
+impl<'a> Simulator<'a> {
+	pub fn new(fragment_len: usize, nfragments: usize, use_energy: bool, seqinput: &'a mut SequenceInput, probe_multiplicities: &'a HashMap<String, usize>) -> Self {
+		let mut sim = Simulator {
+			fragment_len,
+			nfragments,
+			use_energy,
+			seqinput,
+			cur_aln: None,
+			cur_window: Window::default(),
+			cur_probe: Probe { pos_start: 0, pos_end: 0, score: 0.0 },
+			end_reached: false,
+			probe_multiplicities,
+			vec_windows: Vec::<Window<Probe>>::new(),
+		};
+		sim.cur_aln = Simulator::get_next_read(&mut sim.seqinput.samreader);
+		if sim.cur_aln.is_some() {
+			let aln = sim.cur_aln.as_ref().unwrap();
+			sim.cur_probe = Probe {
+				pos_start: aln.start() as usize,
+				pos_end: (aln.calculate_end()-1) as usize,
+				score: Simulator::score_aln(&aln, sim.probe_multiplicities),
+			};
+		}
+		else {
+			panic!("No initial alignment found in SAM file");
+		}
+		sim
+	}
+
+	pub fn get_next_read(samreader: &mut SamReader<BufReader<File>>) -> Option<BamRecord> {
+        match samreader.next() {
+			Some(Ok(aln)) => {
+				Some(aln)
+			},
+			Some(Err(e)) => {
+				panic!("Error reading next SAM record: {}", e);
+			},
+			None => {
+				None
+			}
         }
     }
 
-    pub fn score_aln(&mut self) {
-        let mut trimer = 0u8;
+	pub fn score_aln(record: &BamRecord, probe_multiplicities: &HashMap<String, usize>) -> f64{
+		let mut ftrimer = 0u8;
+		let mut rtrimer = 0u8;
+		let shift = 4;
         let mask:u8 = 0b00111111;
         let mut profile = SVector::<f64, 32>::zeros();
         let mut count : u8 = 0;
-        for entry in self.aln.alignment_entries().unwrap() {
+        for entry in record.alignment_entries().unwrap() {
             if entry.is_seq_match() {
-                unsafe {
-                    trimer = (trimer << 2) & mask | (*BYTE2BITS.as_ptr().add(entry.record_nt().unwrap() as usize));
-                }
+				ftrimer = (ftrimer << 2) & mask | nt2bits(entry.record_nt().unwrap());
+				rtrimer = (rtrimer >> 2) | (comp2(nt2bits(entry.record_nt().unwrap())) << shift);
+				let trimer = cmp::min(ftrimer,rtrimer);
                 count += 1;
                 if count >= 3 {
-                    let mut index = 0;
-                    if let Some(&i) = TRIMER_INDEX.get(&trimer) {
-                        index = i;
-                    }
-                    profile[index] += 1.;
+                    profile[TRIMER_INDEX[trimer as usize] as usize] += 1.;
                 }
             }
             else {
-                trimer = 0;
+                ftrimer = 0;
+				rtrimer = 0;
                 count = 0;
             }
         }
-        self.cur_score -= profile.dot(&SCORE) as f64;
-    }
+		let rname = str::from_utf8(record.name()).unwrap_or("");
+		let mult = *probe_multiplicities.get(rname).unwrap_or(&1);
+        profile.dot(&SCORE) as f64 * (mult as f64)
+	}
 
-    pub fn init(&mut self, samreader: &mut SamReader<BufReader<File>>) {
-        self.get_next_read(samreader);
-        self.cur_aln_start = self.aln.start() as usize;
-        self.cur_bucket_start = self.aln.start() as usize;
-    }
+	pub fn compute_distr(window: &Window<Probe>, flen: usize) -> Vec<(usize, usize, usize)> {
+		let start = window.front().unwrap().pos_start;
+		let end = window.back().unwrap().pos_end;
 
-    pub fn get_next_read(&mut self, samreader: &mut SamReader<BufReader<File>>) -> bool {
-        match samreader.next() {
-            Some(Ok(aln)) => {
-                self.aln = aln;
-                false
-            },
-            _ => {
-                true
-            }
-        }
-    }
+		let mut rectangles: Vec<(usize, usize, usize)> = Vec::new();
+		let l = window.len();
 
-    pub fn generate_fragments(
-        &mut self,
-        output_writer: &mut BufWriter<File>,
-        seq: &[u8],
-        cur_genome: &[u8],
-    ) {
-        let lambda: f64;
-        if self.use_energy {
-            lambda = self.cur_score/20.;
-        } else {
-            lambda = self.cur_count as f64;
-        }
-        let poisson = Poisson::new(lambda).unwrap();
-        let s = poisson.sample(&mut rand::rng());
-        println!(
-            "Generating {} fragments for bucket [{} - {}] containing {} probes with score {} in genome {}",
-            s, self.cur_bucket_start, self.cur_bucket_end, self.cur_count, self.cur_score, str::from_utf8(cur_genome).unwrap()
-        );
-        let bucket_size = self.cur_bucket_end - self.cur_bucket_start + 1;
-        let valid_start = self.cur_bucket_start.saturating_sub(self.fragment_len-bucket_size);
-        let valid_end = self.cur_bucket_start;
+		// Slide the window from start to end-flen+1
+		let mut window_start = start;
+		let mut window_end = window_start + flen - 1;
 
-        // Generate reads if we have a valid range
-        if valid_start < valid_end {
-            let mut rng = rand::rng();
-            for i in 0..s as usize {
-                // Generate a random starting position
-                let start_pos = rng.random_range(valid_start..=valid_end);
-                let end_pos = min(start_pos + self.fragment_len, seq.len());
-                
-                // Extract the read from the sequence
-                let read = &seq[start_pos..end_pos];
-                // Write the read to the output file
-                let id = format!("read_{}_{}_{}_{}", self.nreads+i, str::from_utf8(cur_genome).unwrap(), start_pos, end_pos);
-                let _ = seq_io::fasta::write_parts(&mut *output_writer, id.as_bytes(), None, read);
-                
-                // Do something with the read (save to file, store in collection, etc.)
-                //println!("Generated read at position {}", start_pos+cur_start);
-            }
-        }
-        self.nreads += s as usize;
-    }
+		let mut probes_in_window: usize = 0;
+		let mut probe_starts = Vec::with_capacity(l);
+		let mut probe_ends = Vec::with_capacity(l);
 
-}
+		// Collect probe starts and ends
+		for probe in &window.probes {
+			probe_starts.push(probe.pos_start);
+			probe_ends.push(probe.pos_end);
+		}
 
-pub struct Simulation<'a> {
-    pub sim : Simulator,
-    ref_reader : &'a mut Reader<File>,
-    pub samreader : &'a mut SamReader<BufReader<File>>,
-    output_writer : &'a mut BufWriter<File>,
-}
+		let mut idx_window_head = 0;
+		let mut idx = 0;
 
-impl<'a> Simulation<'a> {
-    pub fn new(
-        fragment_len: usize,
-        bucket_size: usize,
+		while idx < l
+			&& window_start <= probe_starts[idx]
+			&& probe_ends[idx] <= window_end
+		{
+			probes_in_window += 1;
+			idx += 1;
+		}
+
+		// Store rectangles as (start, width, count)
+		while window_end <= end {
+			let s_diff = if probes_in_window > 0 { probe_starts[idx_window_head].saturating_sub(window_start) } else { usize::MAX };
+			let e_diff = if idx < l { probe_ends[idx].saturating_sub(window_end) } else { usize::MAX };
+			let max_jump = end.saturating_sub(window_end);
+        	let jump = cmp::min(cmp::min(s_diff, e_diff), max_jump);
+
+			rectangles.push((window_start, jump+1, probes_in_window));
+			window_start += jump + 1;
+			window_end = window_start + flen - 1;
+
+			// Remove probes that are no longer in the window
+			while idx_window_head < l && probe_ends[idx_window_head] < window_start {
+				probes_in_window -= 1;
+				idx_window_head += 1;
+			}
+
+			while idx < l
+				&& window_start <= probe_starts[idx]
+				&& probe_ends[idx] <= window_end
+			{
+				probes_in_window += 1;
+				idx += 1;
+			}
+		}
+
+		rectangles
+	}
+
+	pub fn generate_fragments(
+        window: &Window<Probe>, 
+        count: usize, 
+        score: f64, 
+        flen: usize, 
+        nfragments: usize,
         use_energy: bool,
-        ref_reader: &'a mut Reader<File>,
-        samreader: &'a mut SamReader<BufReader<File>>,
-        output_writer: &'a mut BufWriter<File>,
-    ) -> Simulation<'a> {
-        Simulation {
-            sim: Simulator::new(
-                fragment_len,
-                bucket_size,
-                use_energy
-            ),
-            ref_reader,
-            samreader,
-            output_writer,
+        total_score: f64, 
+        total_count: usize, 
+        seq: &[u8], 
+        cur_genome: &[u8], 
+        output_writer: &mut BufWriter<File>,
+    ) {
+        let mut lambda = count as f64/ total_count as f64 * 0.8 * nfragments as f64;
+        if use_energy {
+            lambda = score / total_score * 0.8 * nfragments as f64;
         }
-    }
+		let rectangles = Simulator::compute_distr(window, flen);
+		let poisson = Poisson::new(lambda).unwrap();
+		let lognorm = LogNormal::new(1000_f64.ln(), 1.0).unwrap();
+		let n = poisson.sample(&mut rand::rng());
 
-    pub fn simulate(&mut self) {
-        let mut genome_ind = -1;
-        self.sim.init(self.samreader);
+		println!("{} {}", n,str::from_utf8(cur_genome).unwrap());
 
-        for record in self.ref_reader.records() {
-            if self.sim.end_reached { break; }
+		let mut rng = rand::rng();
 
-            let record = record.expect("Error reading record");
-            let cur_genome = record.id_bytes();
-            let seq = record.seq();
-            genome_ind += 1;
+		// Build a vector of (start, width, count) for all rectangles with count > 0
+		let valid_rects: Vec<_> = rectangles.iter().filter(|&&(_, _, count)| count > 0).collect();
 
-            if self.sim.aln.ref_id() != genome_ind {
-                continue;
-                // Skip to the next genome if the current reference ID does not match
-            }
+		// If there are no valid rectangles, return early
+		if valid_rects.is_empty() {
+			return;
+		}
 
-            self.sim.cur_bucket_end = min(self.sim.cur_bucket_start + self.sim.bucket_size - 1, seq.len()-1);
-            loop {
-                if genome_ind == self.sim.aln.ref_id() && self.sim.cur_aln_start <= self.sim.cur_bucket_end {
-                    self.sim.cur_count += 1;
-                    self.sim.score_aln();
-                    if self.sim.get_next_read(self.samreader) {
-                        self.sim.end_reached = true;
-                        self.sim.generate_fragments(self.output_writer, seq, cur_genome);
-                        break;
-                    }
+		// Compute the total weight and cumulative weights for O(1) sampling
+		let mut cum_weights = Vec::with_capacity(valid_rects.len());
+		let mut total_weight = 0.0;
+		for &&(_, width, count) in &valid_rects {
+			total_weight += (width * count) as f64;
+			cum_weights.push(total_weight);
+		}
 
-                    self.sim.cur_aln_start = self.sim.aln.start() as usize;
-                    continue;
-                }
+		// Sample fragment start positions
+		for _ in 0..count.min(n as usize) {
+			let x = rng.random_range(0.0..total_weight);
+			// Binary search to find the rectangle
+			let rect_idx = cum_weights.binary_search_by(|w| w.partial_cmp(&x).unwrap()).unwrap_or_else(|i| i);
+			let &(rect_start, rect_width, _) = valid_rects[rect_idx];
+			// Uniformly pick a position within the rectangle
+			let offset = rng.random_range(0..rect_width);
+			let frag_start = rect_start + offset;
+			let frag_end = frag_start + lognorm.sample(&mut rng) as usize;
+			if frag_end <= seq.len() {
+			let frag_seq = &seq[frag_start..frag_end];
+			// Write to output in FASTA format
+			writeln!(
+				output_writer,
+				">{}_{}_{}\n{}",
+				std::str::from_utf8(cur_genome).unwrap_or("genome"),
+				frag_start,
+				frag_end,
+				std::str::from_utf8(frag_seq).unwrap_or("")
+			).unwrap();
+			}
+		}
+	}
 
-                self.sim.generate_fragments(self.output_writer, seq, cur_genome);
-                self.sim.cur_bucket_start = self.sim.cur_aln_start;
-                self.sim.cur_bucket_end = min(self.sim.cur_bucket_start + self.sim.bucket_size - 1, seq.len()-1);
-                self.sim.cur_count = 0;
-                self.sim.cur_score = 0.;
-                if self.sim.aln.ref_id() != genome_ind { break; }
-            }
-        }
-    }
+	pub fn compute_windows(&mut self) -> (f64, usize) {
+		let mut genome_ind = -1;
+		let mut total_score = 0.0;
+        let mut total_count: usize = 0;
+		loop {
+			if self.end_reached {
+				break;
+			}
+			genome_ind += 1;
+			self.cur_window.genome_ind = genome_ind as usize;
+
+			loop {
+
+				if self.cur_aln.is_none() {
+					self.end_reached = true;
+					break;
+				}
+
+				let aln = self.cur_aln.as_ref().unwrap();
+
+				if aln.ref_id() != genome_ind {
+					if !self.cur_window.is_empty() {
+						self.vec_windows.push(self.cur_window.clone());
+						total_score += self.cur_window.score;
+                        total_count += self.cur_window.len();
+						// Generate fragments for the current window before moving to the next genome
+					}
+					self.cur_window.clear();
+					break; // Skip to the next genome if the current reference ID does not match
+				}
+
+				if self.cur_window.is_empty() || self.cur_probe.pos_end <= self.cur_window.get_center().unwrap().pos_start + self.fragment_len - 1 {
+					self.cur_window.push_back(self.cur_probe);
+				} else {
+					self.vec_windows.push(self.cur_window.clone());
+					total_score += self.cur_window.score;
+                    total_count += self.cur_window.len();
+					self.cur_window.push_back(self.cur_probe);
+					self.cur_window.set_center(self.cur_window.len() - 1);
+
+					while !self.cur_window.is_empty() && self.cur_window.front().unwrap().pos_start < self.cur_probe.pos_end - self.fragment_len + 1 {
+						self.cur_window.pop_front();
+					}
+				}
+
+				self.cur_aln = Simulator::get_next_read(&mut self.seqinput.samreader);
+					if self.cur_aln.is_some() {
+						let aln = self.cur_aln.as_ref().unwrap();
+						self.cur_probe = Probe {
+							pos_start: aln.start() as usize,
+							pos_end: (aln.calculate_end()-1) as usize,
+							score: Simulator::score_aln(aln, self.probe_multiplicities),
+						};
+					} 				
+			}
+		}
+		(total_score, total_count)
+	}
+	pub fn simulate(&mut self) {
+		let (total_score, total_count) = self.compute_windows();
+		let mut cur_genome_ind = 0;
+		let mut ind = 0;
+		for record in self.seqinput.ref_reader.records() {
+			let record = record.expect("Error reading record");
+			let cur_genome = record.id_bytes();
+			let seq = record.seq();
+			
+			while ind < self.vec_windows.len() && self.vec_windows[ind].genome_ind == cur_genome_ind {
+				let window = &self.vec_windows[ind];
+				Simulator::generate_fragments(window, window.len(), window.score, self.fragment_len, self.nfragments, self.use_energy, total_score, total_count, seq, cur_genome, &mut self.seqinput.output_writer);
+				ind += 1;
+			}
+			cur_genome_ind += 1;
+		}
+		
+	}
 }
-
