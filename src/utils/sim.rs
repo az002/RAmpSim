@@ -1,7 +1,5 @@
-use core::num;
 use std::collections::{VecDeque, HashMap};
-use std::hash::Hash;
-use bam::{record, Record as BamRecord};
+use bam::{ Record as BamRecord};
 use rand_distr::{Poisson,LogNormal,Distribution};
 use rand::Rng;
 use std::fs::File;
