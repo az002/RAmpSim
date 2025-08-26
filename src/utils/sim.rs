@@ -1,5 +1,7 @@
+use core::num;
 use std::collections::{VecDeque, HashMap};
-use bam::Record as BamRecord;
+use std::hash::Hash;
+use bam::{record, Record as BamRecord};
 use rand_distr::{Poisson,LogNormal,Distribution};
 use rand::Rng;
 use std::fs::File;
@@ -142,6 +144,7 @@ impl<T: ProbeTrait> Window<T> {
 }
 pub struct Simulator<'a> {
     fragment_len: usize,
+	lognorm_sd: f64,
 	nfragments: usize,
     use_energy:bool,
 	seqinput: &'a mut SequenceInput,
@@ -154,9 +157,10 @@ pub struct Simulator<'a> {
 }
 
 impl<'a> Simulator<'a> {
-	pub fn new(fragment_len: usize, nfragments: usize, use_energy: bool, seqinput: &'a mut SequenceInput, probe_multiplicities: &'a HashMap<String, usize>) -> Self {
+	pub fn new(fragment_len: usize, lognorm_sd: f64, nfragments: usize, use_energy: bool, seqinput: &'a mut SequenceInput, probe_multiplicities: &'a HashMap<String, usize>) -> Self {
 		let mut sim = Simulator {
 			fragment_len,
+			lognorm_sd,
 			nfragments,
 			use_energy,
 			seqinput,
@@ -225,8 +229,11 @@ impl<'a> Simulator<'a> {
 	}
 
 	pub fn compute_distr(window: &Window<Probe>, flen: usize) -> Vec<(usize, usize, usize)> {
-		let start = window.front().unwrap().pos_start;
-		let end = window.back().unwrap().pos_end;
+		let front = window.front().unwrap().pos_start;
+		let back = window.back().unwrap().pos_end;
+
+		let start = cmp::min(front, window.get_center().unwrap().pos_end.saturating_sub(flen) + 1);
+		let end = cmp::max(back, window.get_center().unwrap().pos_start + flen - 1);
 
 		let mut rectangles: Vec<(usize, usize, usize)> = Vec::new();
 		let l = window.len();
@@ -263,7 +270,7 @@ impl<'a> Simulator<'a> {
 			let max_jump = end.saturating_sub(window_end);
         	let jump = cmp::min(cmp::min(s_diff, e_diff), max_jump);
 
-			rectangles.push((window_start, jump+1, probes_in_window));
+			rectangles.push((window_start, jump+1, cmp::max(probes_in_window, 1)));
 			window_start += jump + 1;
 			window_end = window_start + flen - 1;
 
@@ -285,11 +292,12 @@ impl<'a> Simulator<'a> {
 		rectangles
 	}
 
-	pub fn generate_fragments(
+	pub fn simulate_telseq_window_fragments(
         window: &Window<Probe>, 
         count: usize, 
         score: f64, 
-        flen: usize, 
+        flen: usize,
+		lognorm_sd: f64,
         nfragments: usize,
         use_energy: bool,
         total_score: f64, 
@@ -297,49 +305,44 @@ impl<'a> Simulator<'a> {
         seq: &[u8], 
         cur_genome: &[u8], 
         output_writer: &mut BufWriter<File>,
-    ) {
-        let mut lambda = count as f64/ total_count as f64 * 0.8 * nfragments as f64;
+		split: f64,
+    ) -> usize{
+        let mut lambda = count as f64/ total_count as f64 * split * nfragments as f64;
         if use_energy {
-            lambda = score / total_score * 0.8 * nfragments as f64;
+            lambda = score / total_score * split * nfragments as f64;
         }
 		let rectangles = Simulator::compute_distr(window, flen);
 		let poisson = Poisson::new(lambda).unwrap();
-		let lognorm = LogNormal::new(1000_f64.ln(), 1.0).unwrap();
-		let n = poisson.sample(&mut rand::rng());
-
-		println!("{} {}", n,str::from_utf8(cur_genome).unwrap());
+		let lognorm = LogNormal::new((flen as f64).ln(), lognorm_sd).unwrap();
+		let n: usize = poisson.sample(&mut rand::rng()) as usize;
 
 		let mut rng = rand::rng();
 
-		// Build a vector of (start, width, count) for all rectangles with count > 0
-		let valid_rects: Vec<_> = rectangles.iter().filter(|&&(_, _, count)| count > 0).collect();
-
 		// If there are no valid rectangles, return early
-		if valid_rects.is_empty() {
-			return;
+		if rectangles.is_empty() {
+			return 0;
 		}
 
 		// Compute the total weight and cumulative weights for O(1) sampling
-		let mut cum_weights = Vec::with_capacity(valid_rects.len());
+		let mut cum_weights = Vec::with_capacity(rectangles.len());
 		let mut total_weight = 0.0;
-		for &&(_, width, count) in &valid_rects {
+		for 	&(_, width, count) in &rectangles {
 			total_weight += (width * count) as f64;
 			cum_weights.push(total_weight);
 		}
 
 		// Sample fragment start positions
-		for _ in 0..count.min(n as usize) {
+		for _ in 0..n{
 			let x = rng.random_range(0.0..total_weight);
 			// Binary search to find the rectangle
 			let rect_idx = cum_weights.binary_search_by(|w| w.partial_cmp(&x).unwrap()).unwrap_or_else(|i| i);
-			let &(rect_start, rect_width, _) = valid_rects[rect_idx];
+			let &(rect_start, rect_width, _) = &rectangles[rect_idx];
 			// Uniformly pick a position within the rectangle
 			let offset = rng.random_range(0..rect_width);
 			let frag_start = rect_start + offset;
-			let frag_end = frag_start + lognorm.sample(&mut rng) as usize;
-			if frag_end <= seq.len() {
+			let frag_end = (frag_start + lognorm.sample(&mut rng) as usize).min(seq.len());
+			// println!("{} {} {} {}", frag_start, frag_end, str::from_utf8(cur_genome).unwrap_or("genome"), seq.len()); // Debugging output
 			let frag_seq = &seq[frag_start..frag_end];
-			// Write to output in FASTA format
 			writeln!(
 				output_writer,
 				">{}_{}_{}\n{}",
@@ -348,8 +351,9 @@ impl<'a> Simulator<'a> {
 				frag_end,
 				std::str::from_utf8(frag_seq).unwrap_or("")
 			).unwrap();
-			}
+			output_writer.flush().unwrap();
 		}
+		n
 	}
 
 	pub fn compute_windows(&mut self) -> (f64, usize) {
@@ -377,9 +381,9 @@ impl<'a> Simulator<'a> {
 						self.vec_windows.push(self.cur_window.clone());
 						total_score += self.cur_window.score;
                         total_count += self.cur_window.len();
+						self.cur_window.clear();
 						// Generate fragments for the current window before moving to the next genome
 					}
-					self.cur_window.clear();
 					break; // Skip to the next genome if the current reference ID does not match
 				}
 
@@ -410,22 +414,99 @@ impl<'a> Simulator<'a> {
 		}
 		(total_score, total_count)
 	}
-	pub fn simulate(&mut self) {
+	pub fn simulate_telseq_fragments(&mut self, split: f64) -> usize {
 		let (total_score, total_count) = self.compute_windows();
 		let mut cur_genome_ind = 0;
 		let mut ind = 0;
-		for record in self.seqinput.ref_reader.records() {
+		let mut fragments_generated = 0;
+		while let Some(record) = self.seqinput.ref_reader.next() {
 			let record = record.expect("Error reading record");
 			let cur_genome = record.id_bytes();
 			let seq = record.seq();
 			
 			while ind < self.vec_windows.len() && self.vec_windows[ind].genome_ind == cur_genome_ind {
 				let window = &self.vec_windows[ind];
-				Simulator::generate_fragments(window, window.len(), window.score, self.fragment_len, self.nfragments, self.use_energy, total_score, total_count, seq, cur_genome, &mut self.seqinput.output_writer);
+				fragments_generated += Simulator::simulate_telseq_window_fragments(window, window.len(), window.score, self.fragment_len, self.lognorm_sd, self.nfragments, self.use_energy, total_score, total_count, seq, cur_genome, &mut self.seqinput.output_writer, split);
 				ind += 1;
 			}
 			cur_genome_ind += 1;
 		}
-		
+		fragments_generated
+	}
+
+	pub fn simulate_genome_background(
+		seqs: &Vec<Vec<u8>>,
+		cur_genome: String,
+		flen: usize,
+		lognorm_sd: f64,
+		nfrags: usize,
+		output_writer: &mut BufWriter<File>,
+	) {
+		let lognorm = LogNormal::new((flen as f64).ln(), lognorm_sd).unwrap();
+		let total_length = seqs.iter().map(|seq| seq.len()).sum::<usize>();
+		let mut rng = rand::rng();
+
+		for seq in seqs {
+			let n = seq.len()/total_length * nfrags;
+			for _ in 0..n {
+				let frag_start = rng.random_range(0..seq.len());
+				let frag_end = frag_start + lognorm.sample(&mut rng) as usize;
+				if frag_end <= seq.len() {
+					let frag_seq = &seq[frag_start..frag_end];
+					writeln!(
+						output_writer,
+						">{}_{}_{}\n{}",
+						cur_genome,
+						frag_start,
+						frag_end,
+						std::str::from_utf8(frag_seq).unwrap_or("")
+					).unwrap();
+				}
+			}
+		}
+	}
+	
+
+	pub fn simulate_background_fragments(
+		&mut self,
+		nfrags: usize,
+		abundances: &HashMap<String, f64>,
+		seqid2refid: &HashMap<String, String>,
+	) {
+		let nfrags = self.nfragments - nfrags;
+		let mut seqs = Vec::new();
+		let record = self.seqinput.ref_reader.next().expect("Error reading first record").unwrap();
+		seqs.push(record.seq().to_vec());
+		let mut cur_genome = seqid2refid.get(str::from_utf8(record.id_bytes()).unwrap()).expect("Failed to get sequence ID").to_string();
+		while let Some(record) = self.seqinput.ref_reader.next() {
+			let record = record.expect("Error reading record");
+			let id = seqid2refid.get(str::from_utf8(record.id_bytes()).unwrap()).expect("Failed to get sequence ID").to_string();
+			if *id == *cur_genome {
+				seqs.push(record.seq().to_vec());
+			}
+			else {
+				let n = abundances.get(&id).unwrap() * nfrags as f64;
+				Simulator::simulate_genome_background(&seqs, cur_genome, self.fragment_len, self.lognorm_sd, n as usize, &mut self.seqinput.output_writer);
+				seqs.clear();
+				cur_genome = id;
+				seqs.push(record.seq().to_vec());
+			}
+		}
+		let n = abundances.get(&cur_genome).unwrap() * nfrags as f64;
+		Simulator::simulate_genome_background(&seqs, cur_genome, self.fragment_len, self.lognorm_sd, n as usize, &mut self.seqinput.output_writer);
+	}
+
+	pub fn simulate(
+		&mut self,
+		abundances: &HashMap<String, f64>,
+		seqid2refid: &HashMap<String, String>,
+		split: f64,
+	) {
+		self.seqinput.ref_reader.next();
+		let pos1 = self.seqinput.ref_reader.position().unwrap().clone();
+		let _ = self.seqinput.ref_reader.seek(&pos1);
+		let fragments_generated = self.simulate_telseq_fragments(split);
+		let _ = self.seqinput.ref_reader.seek(&pos1);
+		self.simulate_background_fragments(fragments_generated, abundances, seqid2refid);
 	}
 }
