@@ -1,5 +1,5 @@
 use std::collections::{VecDeque, HashMap};
-use bam::{ Record as BamRecord};
+use bam::{ header, Record as BamRecord};
 use rand_distr::{Poisson,LogNormal,Distribution};
 use rand::Rng;
 use std::fs::File;
@@ -151,11 +151,24 @@ pub struct Simulator<'a> {
     cur_probe: Probe,
 	end_reached: bool,
 	probe_multiplicities: &'a HashMap<String, usize>,
+	aln_counts: HashMap<String, usize>,
+	abundances: HashMap<String, f64>,
+	seqid2refid: HashMap<String, String>,
 	vec_windows: Vec<Window<Probe>>,
 }
 
 impl<'a> Simulator<'a> {
-	pub fn new(fragment_len: usize, lognorm_sd: f64, nfragments: usize, use_energy: bool, seqinput: &'a mut SequenceInput, probe_multiplicities: &'a HashMap<String, usize>) -> Self {
+	pub fn new(
+		fragment_len: usize, 
+		lognorm_sd: f64, 
+		nfragments: usize, 
+		use_energy: bool, 
+		seqinput: &'a mut SequenceInput, 
+		probe_multiplicities: &'a HashMap<String, usize>, 
+		aln_counts: HashMap<String, usize>, 
+		abundances: HashMap<String, f64>, 
+		seqid2refid: HashMap<String, String>, 
+	) -> Self {
 		let mut sim = Simulator {
 			fragment_len,
 			lognorm_sd,
@@ -167,6 +180,9 @@ impl<'a> Simulator<'a> {
 			cur_probe: Probe { pos_start: 0, pos_end: 0, score: 0.0 },
 			end_reached: false,
 			probe_multiplicities,
+			aln_counts,
+			abundances,
+			seqid2refid,
 			vec_windows: Vec::<Window<Probe>>::new(),
 		};
 		sim.cur_aln = Simulator::get_next_read(&mut sim.seqinput.samreader);
@@ -175,7 +191,7 @@ impl<'a> Simulator<'a> {
 			sim.cur_probe = Probe {
 				pos_start: aln.start() as usize,
 				pos_end: (aln.calculate_end()-1) as usize,
-				score: Simulator::score_aln(&aln, sim.probe_multiplicities),
+				score: Simulator::score_aln(&aln, &sim.probe_multiplicities, &sim.aln_counts, &sim.abundances, &sim.seqid2refid),
 			};
 		}
 		else {
@@ -198,7 +214,7 @@ impl<'a> Simulator<'a> {
         }
     }
 
-	pub fn score_aln(record: &BamRecord, probe_multiplicities: &HashMap<String, usize>) -> f64{
+	pub fn score_aln(record: &BamRecord, probe_multiplicities: &HashMap<String, usize>, aln_counts: &HashMap<String, usize>, abundances: &HashMap<String, f64>, seqid2refid: &HashMap<String, String>) -> f64{
 		let mut ftrimer = 0u8;
 		let mut rtrimer = 0u8;
 		let shift = 4;
@@ -223,7 +239,9 @@ impl<'a> Simulator<'a> {
         }
 		let rname = str::from_utf8(record.name()).unwrap_or("");
 		let mult = *probe_multiplicities.get(rname).unwrap_or(&1);
-        profile.dot(&SCORE) as f64 * (mult as f64)
+		let aln_count = *aln_counts.get(rname).unwrap_or(&1) as f64;
+		let abundance = *abundances.get(seqid2refid.get(rname).unwrap_or(&"".to_string())).unwrap_or(&1.0);
+        profile.dot(&SCORE) as f64 * (mult as f64) * abundance / aln_count 
 	}
 
 	pub fn compute_distr(window: &Window<Probe>, flen: usize) -> Vec<(usize, usize, usize)> {
@@ -351,6 +369,7 @@ impl<'a> Simulator<'a> {
 			).unwrap();
 			output_writer.flush().unwrap();
 		}
+		println!("Simulated {} fragments for genome {}", n, std::str::from_utf8(cur_genome).unwrap_or("genome"));
 		n
 	}
 
@@ -405,7 +424,7 @@ impl<'a> Simulator<'a> {
 						self.cur_probe = Probe {
 							pos_start: aln.start() as usize,
 							pos_end: (aln.calculate_end()-1) as usize,
-							score: Simulator::score_aln(aln, self.probe_multiplicities),
+							score: Simulator::score_aln(aln, &self.probe_multiplicities, &self.aln_counts, &self.abundances, &self.seqid2refid),
 						};
 					} 				
 			}
@@ -468,36 +487,32 @@ impl<'a> Simulator<'a> {
 	pub fn simulate_background_fragments(
 		&mut self,
 		nfrags: usize,
-		abundances: &HashMap<String, f64>,
-		seqid2refid: &HashMap<String, String>,
 	) {
 		let nfrags = self.nfragments - nfrags;
 		let mut seqs = Vec::new();
 		let record = self.seqinput.ref_reader.next().expect("Error reading first record").unwrap();
 		seqs.push(record.seq().to_vec());
-		let mut cur_genome = seqid2refid.get(str::from_utf8(record.id_bytes()).unwrap()).expect("Failed to get sequence ID").to_string();
+		let mut cur_genome = self.seqid2refid.get(str::from_utf8(record.id_bytes()).unwrap()).expect("Failed to get sequence ID").to_string();
 		while let Some(record) = self.seqinput.ref_reader.next() {
 			let record = record.expect("Error reading record");
-			let id = seqid2refid.get(str::from_utf8(record.id_bytes()).unwrap()).expect("Failed to get sequence ID").to_string();
+			let id = self.seqid2refid.get(str::from_utf8(record.id_bytes()).unwrap()).expect("Failed to get sequence ID").to_string();
 			if *id == *cur_genome {
 				seqs.push(record.seq().to_vec());
 			}
 			else {
-				let n = abundances.get(&id).unwrap() * nfrags as f64;
+				let n = self.abundances.get(&id).unwrap() * nfrags as f64;
 				Simulator::simulate_genome_background(&seqs, cur_genome, self.fragment_len, self.lognorm_sd, n as usize, &mut self.seqinput.output_writer);
 				seqs.clear();
 				cur_genome = id;
 				seqs.push(record.seq().to_vec());
 			}
 		}
-		let n = abundances.get(&cur_genome).unwrap() * nfrags as f64;
+		let n = self.abundances.get(&cur_genome).unwrap() * nfrags as f64;
 		Simulator::simulate_genome_background(&seqs, cur_genome, self.fragment_len, self.lognorm_sd, n as usize, &mut self.seqinput.output_writer);
 	}
 
 	pub fn simulate(
 		&mut self,
-		abundances: &HashMap<String, f64>,
-		seqid2refid: &HashMap<String, String>,
 		split: f64,
 	) {
 		self.seqinput.ref_reader.next();
@@ -505,6 +520,6 @@ impl<'a> Simulator<'a> {
 		let _ = self.seqinput.ref_reader.seek(&pos1);
 		let fragments_generated = self.simulate_telseq_fragments(split);
 		let _ = self.seqinput.ref_reader.seek(&pos1);
-		self.simulate_background_fragments(fragments_generated, abundances, seqid2refid);
+		self.simulate_background_fragments(fragments_generated);
 	}
 }

@@ -1,6 +1,7 @@
 use bam::SamReader;
 use std::fs::File;
 use std::io::{BufWriter, BufRead};
+use std::collections::HashMap;
 use seq_io::fasta::Reader;
 use clap::Parser;
 
@@ -62,6 +63,16 @@ fn main() {
     // let ref_path = "/usr1/aidanz/projects/read_sim/data/fasta/ZymoMOCK/concat_mock.fa";
 
     // let output_path = "/usr1/aidanz/projects/read_sim/data/sim_output/new_reads.fa";
+
+    //loop through sam file once to get number of times each probe was aligned
+    let records = SamReader::from_path(&args.sam_path).unwrap();
+    let mut probe_counts: HashMap<String, usize> = HashMap::new();
+    for record in records {
+        let record = record.unwrap();
+        let probe = String::from_utf8(record.name().to_vec()).unwrap();
+        *probe_counts.entry(probe).or_insert(0) += 1;
+    }
+
     let mut seq_in = SequenceInput {
 		samreader: SamReader::from_path(args.sam_path).unwrap(),
 		ref_reader: Reader::from_path(args.ref_path).expect("Failed to open reference file"),
@@ -88,25 +99,25 @@ fn main() {
     };
 
     let abundances = {
-            let file = File::open(args.abundances).expect("Failed to open abundances file");
-            let reader = std::io::BufReader::new(file);
-            let mut map = std::collections::HashMap::new();
-            for line in reader.lines() {
-                let line = line.expect("Failed to read line");
-                let parts: Vec<&str> = line.split('\t').collect();
-                if parts.len() == 2 {
-                    let id = parts[0].to_string();
-                    let count: f64 = parts[1].parse().expect("Failed to parse count");
-                    map.insert(id, count);
-                }
+        let file = File::open(args.abundances).expect("Failed to open abundances file");
+        let reader = std::io::BufReader::new(file);
+        let mut map = std::collections::HashMap::new();
+        for line in reader.lines() {
+            let line = line.expect("Failed to read line");
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() == 2 {
+                let id = parts[0].to_string();
+                let count: f64 = parts[1].parse().expect("Failed to parse count");
+                map.insert(id, count);
             }
-            map
-        };
+        }
+        map
+    };
     
     let sequenceid2refid = {
         let file = File::open(args.sequence_ids).expect("Failed to open sequence IDs file");
         let reader = std::io::BufReader::new(file);
-        let mut map = std::collections::HashMap::new();
+        let mut map = HashMap::new();
         for line in reader.lines() {
             let line = line.expect("Failed to read line");
             let parts: Vec<&str> = line.split('\t').collect();
@@ -127,6 +138,6 @@ fn main() {
 
     // simulation.sim.score_aln();
 
-    let mut sim = Simulator::new(args.fragment_len, args.lognorm_sd, args.nfragments/args.pass_num, args.use_energy, &mut seq_in, &probe_multiplicities);
-	sim.simulate(&abundances,&sequenceid2refid, args.split);
+    let mut sim = Simulator::new(args.fragment_len, args.lognorm_sd, args.nfragments/args.pass_num, args.use_energy, &mut seq_in, &probe_multiplicities, probe_counts, abundances, sequenceid2refid);
+	sim.simulate(args.split);
 }

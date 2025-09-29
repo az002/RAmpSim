@@ -9,7 +9,12 @@ import collections
 
 def coverage_from_sam(file,targets=None):
     coverage = dict()
-    samfile = pysam.AlignmentFile(file, "r")
+    if file.endswith('.sam'):
+        samfile = pysam.AlignmentFile(file, "r")
+    elif file.endswith('.bam'):
+        samfile = pysam.AlignmentFile(file, "rb")
+    else:
+        raise ValueError("File must be .sam or .bam")
     for read in samfile:
         ref_name = read.reference_name
         if not ref_name:
