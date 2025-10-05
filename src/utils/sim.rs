@@ -1,7 +1,7 @@
 use std::collections::{VecDeque, HashMap};
 use bam::{ header, Record as BamRecord};
-use rand_distr::{Poisson,LogNormal,Distribution};
-use rand::Rng;
+use rand::prelude::*;
+use rand_distr::{LogNormal, Distribution};
 use std::fs::File;
 use std::io::{BufWriter, BufReader};
 use bam::SamReader;
@@ -23,6 +23,9 @@ static BYTE2BITS: [u8; 256] = {
     l[b't' as usize] = 0b11;
     l
 };
+
+const BETA: f64 = 1.0/0.001987;
+
 #[inline]
 fn nt2bits(b: u8) -> u8 { BYTE2BITS[b as usize] }
 
@@ -67,154 +70,55 @@ const SCORE : SVector<f64, 32> = SVector::<f64,32>::from_array_storage(ArrayStor
     -2.617678120625974,  -1.5216318279285466e-24,  -0.8229383115364808,  -2.1347399492841697, 
     -1.502770970281663e-38,  -0.8507439536421594,  -0.31680823162220356,  -0.06611591220578053]]));
 
-
-pub trait ProbeTrait {
-	fn score(&self) -> f64;
-}
-
-#[derive(Clone, Copy, Default, Debug)]
-pub struct Probe {
-	pub pos_start: usize,
-    pub pos_end: usize,
+pub struct Hit {
 	pub score: f64,
-}
-
-impl ProbeTrait for Probe {
-	fn score(&self) -> f64 { self.score }
+	pub seq_id: String,
+	pub start: usize,
+	pub end: usize,
 }
 
 pub struct SequenceInput {
 	pub samreader: SamReader<BufReader<File>>,
-	pub ref_reader: Reader<File>,
 	pub output_writer: BufWriter<File>,
 }
 
-#[derive(Clone, Default, Debug)]
-pub struct Window<T> {
-	pub probes : VecDeque<T>,
-	center : usize,
-	score: f64,
-	genome_ind: usize,
-}
-impl<T: ProbeTrait> Window<T> {
 
-	pub fn get_center(&self) -> Option<&T> { 
-		self.probes.get(self.center) 
-	}
-
-	pub fn len(&self) -> usize { self.probes.len()}
-
-	pub fn push_back(&mut self, item: T) {
-		self.score += item.score();
-		self.probes.push_back(item);
-	}
-
-	pub fn is_empty(&self) -> bool { self.probes.is_empty() }
-
-	pub fn pop_front(&mut self) -> Option<T> {
-		if self.center > 0 {
-			self.center -= 1;
-		}
-		let popped = self.probes.pop_front();
-		if popped.is_some() {
-			self.score -= popped.as_ref().unwrap().score();
-		}
-		popped
-	}
-
-	pub fn front(&self) -> Option<&T> { self.probes.front() }
-
-	pub fn back(&self) -> Option<&T> { self.probes.back() }
-
-	pub fn set_center(&mut self, index: usize) {
-		if index < self.probes.len() {
-			self.center = index;
-		} else {
-			panic!("Index out of bounds for setting center in Window");
-		}
-	}
-
-	pub fn clear(&mut self) {
-		self.probes.clear();
-		self.center = 0;
-		self.score = 0.0;
-	}
-}
-pub struct Simulator<'a> {
+pub struct Simulator {
     fragment_len: usize,
 	lognorm_sd: f64,
 	nfragments: usize,
-    use_energy:bool,
-	seqinput: &'a mut SequenceInput,
-    pub cur_aln: Option<BamRecord>,
-    cur_window: Window<Probe>,
-    cur_probe: Probe,
-	end_reached: bool,
-	probe_multiplicities: &'a HashMap<String, usize>,
-	aln_counts: HashMap<String, usize>,
+	split: f64,
+	temperature: f64,
+	probe_multiplicities: HashMap<String, usize>,
 	abundances: HashMap<String, f64>,
 	seqid2refid: HashMap<String, String>,
-	vec_windows: Vec<Window<Probe>>,
 }
 
-impl<'a> Simulator<'a> {
+impl Simulator {
 	pub fn new(
 		fragment_len: usize, 
 		lognorm_sd: f64, 
-		nfragments: usize, 
-		use_energy: bool, 
-		seqinput: &'a mut SequenceInput, 
-		probe_multiplicities: &'a HashMap<String, usize>, 
-		aln_counts: HashMap<String, usize>, 
-		abundances: HashMap<String, f64>, 
-		seqid2refid: HashMap<String, String>, 
+		nfragments: usize,
+		split: f64,
+		temperature: f64,
+		probe_multiplicities: HashMap<String, usize>,
+		abundances: HashMap<String, f64>,
+		seqid2refid: HashMap<String, String>,
 	) -> Self {
 		let mut sim = Simulator {
 			fragment_len,
 			lognorm_sd,
 			nfragments,
-			use_energy,
-			seqinput,
-			cur_aln: None,
-			cur_window: Window::default(),
-			cur_probe: Probe { pos_start: 0, pos_end: 0, score: 0.0 },
-			end_reached: false,
+			split,
+			temperature,
 			probe_multiplicities,
-			aln_counts,
 			abundances,
 			seqid2refid,
-			vec_windows: Vec::<Window<Probe>>::new(),
 		};
-		sim.cur_aln = Simulator::get_next_read(&mut sim.seqinput.samreader);
-		if sim.cur_aln.is_some() {
-			let aln = sim.cur_aln.as_ref().unwrap();
-			sim.cur_probe = Probe {
-				pos_start: aln.start() as usize,
-				pos_end: (aln.calculate_end()-1) as usize,
-				score: Simulator::score_aln(&aln, &sim.probe_multiplicities, &sim.aln_counts, &sim.abundances, &sim.seqid2refid),
-			};
-		}
-		else {
-			panic!("No initial alignment found in SAM file");
-		}
 		sim
 	}
 
-	pub fn get_next_read(samreader: &mut SamReader<BufReader<File>>) -> Option<BamRecord> {
-        match samreader.next() {
-			Some(Ok(aln)) => {
-				Some(aln)
-			},
-			Some(Err(e)) => {
-				panic!("Error reading next SAM record: {}", e);
-			},
-			None => {
-				None
-			}
-        }
-    }
-
-	pub fn score_aln(record: &BamRecord, probe_multiplicities: &HashMap<String, usize>, aln_counts: &HashMap<String, usize>, abundances: &HashMap<String, f64>, seqid2refid: &HashMap<String, String>) -> f64{
+	pub fn process_hit(record: &BamRecord, seqid: String, temp: f64, abundances: &HashMap<String, f64>, seqid2refid: &HashMap<String, String>) -> Hit{
 		let mut ftrimer = 0u8;
 		let mut rtrimer = 0u8;
 		let shift = 4;
@@ -237,289 +141,90 @@ impl<'a> Simulator<'a> {
                 count = 0;
             }
         }
-		let rname = str::from_utf8(record.name()).unwrap_or("");
-		let mult = *probe_multiplicities.get(rname).unwrap_or(&1);
-		let aln_count = *aln_counts.get(rname).unwrap_or(&1) as f64;
-		let abundance = *abundances.get(seqid2refid.get(rname).unwrap_or(&"".to_string())).unwrap_or(&1.0);
-        profile.dot(&SCORE) as f64 * (mult as f64) * abundance / aln_count 
-	}
-
-	pub fn compute_distr(window: &Window<Probe>, flen: usize) -> Vec<(usize, usize, usize)> {
-		let front = window.front().unwrap().pos_start;
-		let back = window.back().unwrap().pos_end;
-
-		let start = cmp::min(front, window.get_center().unwrap().pos_end.saturating_sub(flen) + 1);
-		let end = cmp::max(back, window.get_center().unwrap().pos_start + flen - 1);
-
-		let mut rectangles: Vec<(usize, usize, usize)> = Vec::new();
-		let l = window.len();
-
-		// Slide the window from start to end-flen+1
-		let mut window_start = start;
-		let mut window_end = window_start + flen - 1;
-
-		let mut probes_in_window: usize = 0;
-		let mut probe_starts = Vec::with_capacity(l);
-		let mut probe_ends = Vec::with_capacity(l);
-
-		// Collect probe starts and ends
-		for probe in &window.probes {
-			probe_starts.push(probe.pos_start);
-			probe_ends.push(probe.pos_end);
-		}
-
-		let mut idx_window_head = 0;
-		let mut idx = 0;
-
-		while idx < l
-			&& window_start <= probe_starts[idx]
-			&& probe_ends[idx] <= window_end
-		{
-			probes_in_window += 1;
-			idx += 1;
-		}
-
-		// Store rectangles as (start, width, count)
-		while window_end <= end {
-			let s_diff = if probes_in_window > 0 { probe_starts[idx_window_head].saturating_sub(window_start) } else { usize::MAX };
-			let e_diff = if idx < l { probe_ends[idx].saturating_sub(window_end) } else { usize::MAX };
-			let max_jump = end.saturating_sub(window_end);
-        	let jump = cmp::min(cmp::min(s_diff, e_diff), max_jump);
-
-			rectangles.push((window_start, jump+1, cmp::max(probes_in_window, 1)));
-			window_start += jump + 1;
-			window_end = window_start + flen - 1;
-
-			// Remove probes that are no longer in the window
-			while idx_window_head < l && probe_ends[idx_window_head] < window_start {
-				probes_in_window -= 1;
-				idx_window_head += 1;
-			}
-
-			while idx < l
-				&& window_start <= probe_starts[idx]
-				&& probe_ends[idx] <= window_end
-			{
-				probes_in_window += 1;
-				idx += 1;
-			}
-		}
-
-		rectangles
-	}
-
-	pub fn simulate_telseq_window_fragments(
-        window: &Window<Probe>, 
-        count: usize, 
-        score: f64, 
-        flen: usize,
-		lognorm_sd: f64,
-        nfragments: usize,
-        use_energy: bool,
-        total_score: f64, 
-        total_count: usize, 
-        seq: &[u8], 
-        cur_genome: &[u8], 
-        output_writer: &mut BufWriter<File>,
-		split: f64,
-    ) -> usize{
-        let mut lambda = count as f64/ total_count as f64 * split * nfragments as f64;
-        if use_energy {
-            lambda = score / total_score * split * nfragments as f64;
+		// println!("Processing record: {}", seqid);
+		let refname = seqid2refid.get(&seqid).expect("Reference name not found");
+		let abundance = *abundances.get(refname).unwrap_or(&0.0);
+        Hit {
+            score: (-BETA/temp*profile.dot(&SCORE)).exp() * abundance,
+            seq_id: seqid,
+            start: record.start() as usize,
+            end: record.calculate_end() as usize,
         }
-		let rectangles = Simulator::compute_distr(window, flen);
-		let poisson = Poisson::new(lambda).unwrap();
-		let lognorm = LogNormal::new((flen as f64).ln(), lognorm_sd).unwrap();
-		let n: usize = poisson.sample(&mut rand::rng()) as usize;
+	}
+
+	pub fn compute_telseq_distr(&mut self, seqinput: &mut SequenceInput) -> HashMap<String, Vec<Hit>> {
+		let mut probe_hits: HashMap<String, Vec<Hit>> = HashMap::new();
+		let header = seqinput.samreader.header().to_owned();
+		for result in &mut seqinput.samreader {
+			match result {
+				Ok(record) => {
+					let seqid = header.reference_name(record.ref_id() as u32).unwrap().to_string();
+					let hit = Simulator::process_hit(&record, seqid, self.temperature, &self.abundances, &self.seqid2refid);
+					probe_hits.entry(String::from_utf8(record.name().to_vec()).expect("Invalid UTF-8")).or_default().push(hit);
+				},
+				Err(e) => {
+					eprintln!("Error reading SAM record: {}", e);
+					continue;
+				}
+			}
+		}
+		probe_hits
+	}
+
+	pub fn sample_telseq(&mut self, seqinput: &mut SequenceInput, ref_seqs : &HashMap<String, String>) {
+		let mut probe_hits = self.compute_telseq_distr(seqinput);
+		let probs: Vec<f64> = self.probe_multiplicities.iter()
+			.filter(|(k, _)| probe_hits.contains_key(*k))
+			.map(|(_, v)| *v as f64)
+			.collect();
+		let probe_names: Vec<String> = self.probe_multiplicities.keys()
+			.filter(|k| probe_hits.contains_key(*k))
+			.cloned()
+			.collect();
 
 		let mut rng = rand::rng();
+		let multinomial = rand::distr::weighted::WeightedIndex::new(&probs).unwrap();
 
-		// If there are no valid rectangles, return early
-		if rectangles.is_empty() {
-			return 0;
-		}
+		let lognorm = LogNormal::new((self.fragment_len as f64).ln(), self.lognorm_sd).unwrap();
+		let n = (self.nfragments as f64 * self.split) as usize;
+		eprintln!("Sampling {} telseq fragments", n);
+		for _ in 0..n {
+			let idx = multinomial.sample(&mut rng);
+			let probe_name = &probe_names[idx];
 
-		// Compute the total weight and cumulative weights for O(1) sampling
-		let mut cum_weights = Vec::with_capacity(rectangles.len());
-		let mut total_weight = 0.0;
-		for 	&(_, width, count) in &rectangles {
-			total_weight += (width * count) as f64;
-			cum_weights.push(total_weight);
-		}
+			if let Some(hits) = probe_hits.get_mut(probe_name) {
+				if !hits.is_empty() {
+					let hit_probs = hits.iter().map(|h| h.score).collect::<Vec<f64>>();
+					let hit_dist = rand::distr::weighted::WeightedIndex::new(&hit_probs).unwrap();
+					let hit_idx = hit_dist.sample(&mut rng);
+					let hit = &hits[hit_idx];
+					let ref_seq = ref_seqs.get(&hit.seq_id).expect("Reference sequence not found");
 
-		// Sample fragment start positions
-		for _ in 0..n{
-			let x = rng.random_range(0.0..total_weight);
-			// Binary search to find the rectangle
-			let rect_idx = cum_weights.binary_search_by(|w| w.partial_cmp(&x).unwrap()).unwrap_or_else(|i| i);
-			let &(rect_start, rect_width, _) = &rectangles[rect_idx];
-			// Uniformly pick a position within the rectangle
-			let offset = rng.random_range(0..rect_width);
-			let frag_start = rect_start + offset;
-			let frag_end = (frag_start + lognorm.sample(&mut rng) as usize).min(seq.len());
-			// println!("{} {} {} {}", frag_start, frag_end, str::from_utf8(cur_genome).unwrap_or("genome"), seq.len()); // Debugging output
-			let frag_seq = &seq[frag_start..frag_end];
-			writeln!(
-				output_writer,
-				">{}_{}_{}\n{}",
-				std::str::from_utf8(cur_genome).unwrap_or("genome"),
-				frag_start,
-				frag_end,
-				std::str::from_utf8(frag_seq).unwrap_or("")
-			).unwrap();
-			output_writer.flush().unwrap();
-		}
-		println!("Simulated {} fragments for genome {}", n, std::str::from_utf8(cur_genome).unwrap_or("genome"));
-		n
-	}
+					let frag_len = lognorm.sample(&mut rng) as usize;
 
-	pub fn compute_windows(&mut self) -> (f64, usize) {
-		let mut genome_ind = -1;
-		let mut total_score = 0.0;
-        let mut total_count: usize = 0;
-		loop {
-			if self.end_reached {
-				break;
-			}
-			genome_ind += 1;
-			self.cur_window.genome_ind = genome_ind as usize;
+					let min_center = hit.start.saturating_sub(self.fragment_len);
+					let max_center = hit.end + self.fragment_len;
+					let max_center = cmp::min(max_center, ref_seq.len());
 
-			loop {
+					let center = if max_center > min_center {
+						rng.random_range(min_center..max_center)
+					} else {
+						min_center
+					};
 
-				if self.cur_aln.is_none() {
-					self.end_reached = true;
-					break;
-				}
+					let frag_start = center.saturating_sub(frag_len / 2);
+					let frag_end = cmp::min(frag_start + frag_len, ref_seq.len());
 
-				let aln = self.cur_aln.as_ref().unwrap();
+					// Write to output
+					let fragment = &ref_seq[frag_start..frag_end];
+					writeln!(seqinput.output_writer, ">{}|{}|{}|{}-{}\n{}",
+						probe_name, hit.seq_id, hit.start, frag_start, frag_end, fragment
+					).expect("Error writing to output");
 
-				if aln.ref_id() != genome_ind {
-					if !self.cur_window.is_empty() {
-						self.vec_windows.push(self.cur_window.clone());
-						total_score += self.cur_window.score;
-                        total_count += self.cur_window.len();
-						self.cur_window.clear();
-						// Generate fragments for the current window before moving to the next genome
-					}
-					break; // Skip to the next genome if the current reference ID does not match
-				}
-
-				if self.cur_window.is_empty() || self.cur_probe.pos_end <= self.cur_window.get_center().unwrap().pos_start + self.fragment_len - 1 {
-					self.cur_window.push_back(self.cur_probe);
-				} else {
-					self.vec_windows.push(self.cur_window.clone());
-					total_score += self.cur_window.score;
-                    total_count += self.cur_window.len();
-					self.cur_window.push_back(self.cur_probe);
-					self.cur_window.set_center(self.cur_window.len() - 1);
-
-					while !self.cur_window.is_empty() && self.cur_window.front().unwrap().pos_start < self.cur_probe.pos_end - self.fragment_len + 1 {
-						self.cur_window.pop_front();
-					}
-				}
-
-				self.cur_aln = Simulator::get_next_read(&mut self.seqinput.samreader);
-					if self.cur_aln.is_some() {
-						let aln = self.cur_aln.as_ref().unwrap();
-						self.cur_probe = Probe {
-							pos_start: aln.start() as usize,
-							pos_end: (aln.calculate_end()-1) as usize,
-							score: Simulator::score_aln(aln, &self.probe_multiplicities, &self.aln_counts, &self.abundances, &self.seqid2refid),
-						};
-					} 				
-			}
-		}
-		(total_score, total_count)
-	}
-	pub fn simulate_telseq_fragments(&mut self, split: f64) -> usize {
-		let (total_score, total_count) = self.compute_windows();
-		let mut cur_genome_ind = 0;
-		let mut ind = 0;
-		let mut fragments_generated = 0;
-		while let Some(record) = self.seqinput.ref_reader.next() {
-			let record = record.expect("Error reading record");
-			let cur_genome = record.id_bytes();
-			let seq = record.seq();
-			
-			while ind < self.vec_windows.len() && self.vec_windows[ind].genome_ind == cur_genome_ind {
-				let window = &self.vec_windows[ind];
-				fragments_generated += Simulator::simulate_telseq_window_fragments(window, window.len(), window.score, self.fragment_len, self.lognorm_sd, self.nfragments, self.use_energy, total_score, total_count, seq, cur_genome, &mut self.seqinput.output_writer, split);
-				ind += 1;
-			}
-			cur_genome_ind += 1;
-		}
-		fragments_generated
-	}
-
-	pub fn simulate_genome_background(
-		seqs: &Vec<Vec<u8>>,
-		cur_genome: String,
-		flen: usize,
-		lognorm_sd: f64,
-		nfrags: usize,
-		output_writer: &mut BufWriter<File>,
-	) {
-		let lognorm = LogNormal::new((flen as f64).ln(), lognorm_sd).unwrap();
-		let total_length = seqs.iter().map(|seq| seq.len()).sum::<usize>();
-		let mut rng = rand::rng();
-
-		for seq in seqs {
-			let n = seq.len()/total_length * nfrags;
-			for _ in 0..n {
-				let frag_start = rng.random_range(0..seq.len());
-				let frag_end = frag_start + lognorm.sample(&mut rng) as usize;
-				if frag_end <= seq.len() {
-					let frag_seq = &seq[frag_start..frag_end];
-					writeln!(
-						output_writer,
-						">{}_{}_{}\n{}",
-						cur_genome,
-						frag_start,
-						frag_end,
-						std::str::from_utf8(frag_seq).unwrap_or("")
-					).unwrap();
+					println!("[TELSEQ]:{}:{}:{}-{}:{}",self.seqid2refid.get(&hit.seq_id).unwrap(), hit.seq_id, frag_start, frag_end, probe_name);
 				}
 			}
 		}
 	}
-	
 
-	pub fn simulate_background_fragments(
-		&mut self,
-		nfrags: usize,
-	) {
-		let nfrags = self.nfragments - nfrags;
-		let mut seqs = Vec::new();
-		let record = self.seqinput.ref_reader.next().expect("Error reading first record").unwrap();
-		seqs.push(record.seq().to_vec());
-		let mut cur_genome = self.seqid2refid.get(str::from_utf8(record.id_bytes()).unwrap()).expect("Failed to get sequence ID").to_string();
-		while let Some(record) = self.seqinput.ref_reader.next() {
-			let record = record.expect("Error reading record");
-			let id = self.seqid2refid.get(str::from_utf8(record.id_bytes()).unwrap()).expect("Failed to get sequence ID").to_string();
-			if *id == *cur_genome {
-				seqs.push(record.seq().to_vec());
-			}
-			else {
-				let n = self.abundances.get(&id).unwrap() * nfrags as f64;
-				Simulator::simulate_genome_background(&seqs, cur_genome, self.fragment_len, self.lognorm_sd, n as usize, &mut self.seqinput.output_writer);
-				seqs.clear();
-				cur_genome = id;
-				seqs.push(record.seq().to_vec());
-			}
-		}
-		let n = self.abundances.get(&cur_genome).unwrap() * nfrags as f64;
-		Simulator::simulate_genome_background(&seqs, cur_genome, self.fragment_len, self.lognorm_sd, n as usize, &mut self.seqinput.output_writer);
-	}
-
-	pub fn simulate(
-		&mut self,
-		split: f64,
-	) {
-		self.seqinput.ref_reader.next();
-		let pos1 = self.seqinput.ref_reader.position().unwrap().clone();
-		let _ = self.seqinput.ref_reader.seek(&pos1);
-		let fragments_generated = self.simulate_telseq_fragments(split);
-		let _ = self.seqinput.ref_reader.seek(&pos1);
-		self.simulate_background_fragments(fragments_generated);
-	}
 }

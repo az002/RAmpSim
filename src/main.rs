@@ -2,7 +2,7 @@ use bam::SamReader;
 use std::fs::File;
 use std::io::{BufWriter, BufRead};
 use std::collections::HashMap;
-use seq_io::fasta::Reader;
+use seq_io::fasta::{Reader, Record};
 use clap::Parser;
 
 
@@ -21,26 +21,23 @@ struct Args {
     #[arg(short, long)]
     sam_path: std::path::PathBuf,
 
-    #[arg(short='l', long, default_value_t = 8000)]
+    #[arg(short='l', long="flen", default_value_t = 8000)]
     fragment_len: usize,
 
-    #[arg(short, long, action)]
-    use_energy: bool,
+    #[arg(short,long)]
+    temperature: f64,
 
-    #[arg(short, long)]
+    #[arg(short, long="mult-file")]
     probe_multiplicity: Option<std::path::PathBuf>,
 
-    #[arg(long)]
+    #[arg(long="seqids")]
     sequence_ids: std::path::PathBuf,
 
     #[arg(short,long)]
     abundances: std::path::PathBuf,
 
-    #[arg(short,long)]
+    #[arg(short,long="nfrag")]
     nfragments: usize,
-
-    #[arg(long)]
-    pass_num: usize,
 
     #[arg(long)]
     split: f64,
@@ -51,35 +48,19 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    println!("ref_path: {:?}", args.ref_path);
-    println!("out_path: {:?}", args.out_path);
-    println!("sam_path: {:?}", args.sam_path);
-    println!("fragment_len: {:?}", args.fragment_len);
-    println!("nfragments: {:?}", args.nfragments);
-    println!("pass_num: {:?}", args.pass_num);
-    println!("use_energy: {:?}", args.use_energy);
-    // let path = "/usr1/aidanz/projects/read_sim/data/alignments/sorted_mock_alignments.sam";
-
-    // let ref_path = "/usr1/aidanz/projects/read_sim/data/fasta/ZymoMOCK/concat_mock.fa";
-
-    // let output_path = "/usr1/aidanz/projects/read_sim/data/sim_output/new_reads.fa";
-
-    //loop through sam file once to get number of times each probe was aligned
-    let records = SamReader::from_path(&args.sam_path).unwrap();
-    let mut probe_counts: HashMap<String, usize> = HashMap::new();
-    for record in records {
-        let record = record.unwrap();
-        let probe = String::from_utf8(record.name().to_vec()).unwrap();
-        *probe_counts.entry(probe).or_insert(0) += 1;
-    }
+    eprintln!("ref_path: {:?}", args.ref_path);
+    eprintln!("out_path: {:?}", args.out_path);
+    eprintln!("sam_path: {:?}", args.sam_path);
+    eprintln!("fragment_len: {:?}", args.fragment_len);
+    eprintln!("nfragments: {:?}", args.nfragments);
+    eprintln!("temperature: {:?}", args.temperature);
 
     let mut seq_in = SequenceInput {
 		samreader: SamReader::from_path(args.sam_path).unwrap(),
-		ref_reader: Reader::from_path(args.ref_path).expect("Failed to open reference file"),
 		output_writer: BufWriter::new(File::create(args.out_path).expect("Failed to create output file")),
 	};
 
-    let probe_multiplicities = match args.probe_multiplicity {
+    let probe_multiplicities: HashMap<String, usize> = match args.probe_multiplicity {
         Some(path) => {
             let file = File::open(path).expect("Failed to open probe multiplicity file");
             let reader = std::io::BufReader::new(file);
@@ -98,7 +79,7 @@ fn main() {
         None => std::collections::HashMap::new(),
     };
 
-    let abundances = {
+    let abundances: HashMap<String, f64> = {
         let file = File::open(args.abundances).expect("Failed to open abundances file");
         let reader = std::io::BufReader::new(file);
         let mut map = std::collections::HashMap::new();
@@ -113,22 +94,34 @@ fn main() {
         }
         map
     };
-    
-    let sequenceid2refid = {
+
+    let seqid2refid: HashMap<String, String> = {
         let file = File::open(args.sequence_ids).expect("Failed to open sequence IDs file");
         let reader = std::io::BufReader::new(file);
-        let mut map = HashMap::new();
+        let mut map: HashMap<String, String> = HashMap::new();
         for line in reader.lines() {
             let line = line.expect("Failed to read line");
             let parts: Vec<&str> = line.split('\t').collect();
             if parts.len() == 2 {
                 let id = parts[0].to_string();
-                let seq_id: String = parts[1].to_string();
+                let seq_id = parts[1].to_string();
                 map.insert(id, seq_id);
             }
         }
         map
     };
+
+    let mut ref_reader = Reader::from_path(args.ref_path).expect("Failed to open reference file");
+    let ref_seqs: HashMap<String, String> = ref_reader
+        .records()
+        .map(|r| {
+            let record = r.expect("Failed to read record");
+            let id = record.id().unwrap().to_string();
+            let seq = String::from_utf8(record.seq().to_vec()).expect("Failed to convert sequence to string");
+            (id, seq)
+        })
+        .collect();
+
 
     // println!("Probe multiplicities: {:?}", probe_multiplicities);
     // println!("Abundances: {:?}", abundances);
@@ -138,6 +131,16 @@ fn main() {
 
     // simulation.sim.score_aln();
 
-    let mut sim = Simulator::new(args.fragment_len, args.lognorm_sd, args.nfragments/args.pass_num, args.use_energy, &mut seq_in, &probe_multiplicities, probe_counts, abundances, sequenceid2refid);
-	sim.simulate(args.split);
+    let mut sim = Simulator::new(
+        args.fragment_len, 
+        args.lognorm_sd, 
+        args.nfragments,
+        args.split,
+        args.temperature,
+        probe_multiplicities,
+        abundances,
+        seqid2refid,
+    );
+    sim.sample_telseq(&mut seq_in, &ref_seqs);
+	// sim.simulate(args.split);
 }
