@@ -10,65 +10,7 @@ use nalgebra::SVector;
 use seq_io::fasta::{Reader, Record};
 use std::cmp;
 use std::io::Write;
-
-static BYTE2BITS: [u8; 256] = {
-    let mut l = [0u8; 256];
-    l[b'A' as usize] = 0b00;
-    l[b'a' as usize] = 0b00;
-    l[b'C' as usize] = 0b01;
-    l[b'c' as usize] = 0b01;
-    l[b'G' as usize] = 0b10;
-    l[b'g' as usize] = 0b10;
-    l[b'T' as usize] = 0b11;
-    l[b't' as usize] = 0b11;
-    l
-};
-
-const BETA: f64 = 1.0/0.001987;
-
-#[inline]
-fn nt2bits(b: u8) -> u8 { BYTE2BITS[b as usize] }
-
-#[inline]
-const fn comp2(x: u8) -> u8 { x ^ 0b11 } // A<->T, C<->G on 2-bit alphabet
-
-#[inline]
-const fn revcomp3(k: u8) -> u8 {
-    let a = comp2((k >> 4) & 0b11);
-    let b = comp2((k >> 2) & 0b11);
-    let c = comp2(k & 0b11);
-    (c << 4) | (b << 2) | a
-}
-
-const fn build_trimer_index() -> [u8; 64] {
-	let mut map = [u8::MAX; 64];
-    let mut next = 0u8;
-    let mut k = 0u8;
-    while k < 64 {
-        let c = {
-            let rc = revcomp3(k);
-            if rc < k { rc } else { k }
-        };
-        if map[c as usize] == u8::MAX {
-            map[c as usize] = next;
-            next += 1;
-        }
-        map[k as usize] = map[c as usize];
-        k += 1;
-    }
-    map
-}
-
-const TRIMER_INDEX: [u8; 64] = build_trimer_index();
-
-const SCORE : SVector<f64, 32> = SVector::<f64,32>::from_array_storage(ArrayStorage([[-1.0333523772924682,  -1.458111012202453,  -1.035949547554549,  -0.7124736682600892, 
-    -1.8355462789826653,  -3.2816907774428596,  -2.9387615700865912,  -2.4322581762379056, 
-    -6.050351136676882e-26,  -1.16892836679913,  -1.2733818523786504,  -0.42044691866600825, 
-    -2.2817669581121254,  -1.4822900733089985,  -0.9125362005565887,  -3.670822543027401e-23, 
-    -1.273598247757921,  -1.3530081563908097e-28,  -0.19137969659843326,  -1.2926131142356785, 
-    -0.3257778299362714,  -2.1797369472925356,  -1.3319137918104318,  -1.7767543614895418, 
-    -2.617678120625974,  -1.5216318279285466e-24,  -0.8229383115364808,  -2.1347399492841697, 
-    -1.502770970281663e-38,  -0.8507439536421594,  -0.31680823162220356,  -0.06611591220578053]]));
+use crate::utils::thermo;
 
 pub struct Hit {
 	pub score: f64,
@@ -121,33 +63,11 @@ impl Simulator {
 	}
 
 	pub fn process_hit(record: &BamRecord, seqid: String, temp: f64, abundances: &HashMap<String, f64>, seqid2refid: &HashMap<String, String>) -> Hit{
-		let mut ftrimer = 0u8;
-		let mut rtrimer = 0u8;
-		let shift = 4;
-        let mask:u8 = 0b00111111;
-        let mut profile = SVector::<f64, 32>::zeros();
-        let mut count : u8 = 0;
-        for entry in record.alignment_entries().unwrap() {
-            if entry.is_seq_match() {
-				ftrimer = (ftrimer << 2) & mask | nt2bits(entry.record_nt().unwrap());
-				rtrimer = (rtrimer >> 2) | (comp2(nt2bits(entry.record_nt().unwrap())) << shift);
-				let trimer = cmp::min(ftrimer,rtrimer);
-                count += 1;
-                if count >= 3 {
-                    profile[TRIMER_INDEX[trimer as usize] as usize] += 1.;
-                }
-            }
-            else {
-                ftrimer = 0;
-				rtrimer = 0;
-                count = 0;
-            }
-        }
-		// println!("Processing record: {}", seqid);
+		let score = thermo::score_bam_alignment_multiT(record, temp, thermo::MismatchStrategy::SkipStacking);
 		let refname = seqid2refid.get(&seqid).expect("Reference name not found");
 		let abundance = *abundances.get(refname).unwrap_or(&0.0);
         Hit {
-            score: (-BETA/temp*profile.dot(&SCORE)).exp() * abundance,
+            score: score * abundance,
             seq_id: seqid,
             start: record.start() as usize,
             end: record.calculate_end() as usize,
