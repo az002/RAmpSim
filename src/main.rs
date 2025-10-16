@@ -55,10 +55,8 @@ fn main() {
     eprintln!("nfragments: {:?}", args.nfragments);
     eprintln!("temperature: {:?}", args.temperature);
 
-    let mut seq_in = SequenceInput {
-		samreader: SamReader::from_path(args.sam_path).unwrap(),
-		output_writer: BufWriter::new(File::create(args.out_path).expect("Failed to create output file")),
-	};
+    let mut probe_alignments = SamReader::from_path(args.sam_path).unwrap();
+    let mut output = BufWriter::new(File::create(args.out_path).expect("Failed to create output file"));
 
     let probe_multiplicities: HashMap<String, usize> = match args.probe_multiplicity {
         Some(path) => {
@@ -141,6 +139,9 @@ fn main() {
         abundances,
         seqid2refid,
     );
-    sim.sample_telseq(&mut seq_in, &ref_seqs);
+    sim.compute_telseq_distr(&mut probe_alignments);
+    sim.sample_telseq(&mut output, &ref_seqs);
+    sim.sample_background(&mut output, &ref_seqs);
+    sim.write_hits("/usr1/aidanz/projects/read_sim/data/sim_output/hits.txt");
 	// sim.simulate(args.split);
 }
