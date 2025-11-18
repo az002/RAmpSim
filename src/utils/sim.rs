@@ -1,13 +1,10 @@
-use std::collections::{VecDeque, HashMap};
-use bam::{ header, Record as BamRecord};
+use std::collections::HashMap;
+use bam::Record as BamRecord;
 use rand::prelude::*;
 use rand_distr::{LogNormal, Distribution};
 use std::fs::File;
 use std::io::{BufWriter, BufReader};
 use bam::SamReader;
-use nalgebra::ArrayStorage;
-use nalgebra::SVector;
-use seq_io::fasta::{Reader, Record};
 use std::cmp;
 use std::io::Write;
 use crate::utils::thermo;
@@ -17,11 +14,6 @@ pub struct Hit {
 	pub seq_id: String,
 	pub start: usize,
 	pub end: usize,
-}
-
-pub struct SequenceInput {
-	pub samreader: SamReader<BufReader<File>>,
-	pub output_writer: BufWriter<File>,
 }
 
 
@@ -48,7 +40,7 @@ impl Simulator {
 		abundances: HashMap<String, f64>,
 		seqid2refid: HashMap<String, String>,
 	) -> Self {
-		let mut sim = Simulator {
+		let sim = Simulator {
 			fragment_len,
 			lognorm_sd,
 			nfragments,
@@ -121,8 +113,8 @@ impl Simulator {
 
 					let frag_len = lognorm.sample(&mut rng) as usize;
 
-					let min_center = hit.end.saturating_sub(self.fragment_len);
-					let max_center = hit.start + self.fragment_len;
+					let min_center = hit.end.saturating_sub(self.fragment_len/2);
+					let max_center = hit.start + self.fragment_len/2;
 					let max_center = cmp::min(max_center, ref_seq.len());
 
 					let center = if max_center > min_center {
