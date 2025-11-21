@@ -1,0 +1,10 @@
+Listeria monocytogenes	0.8912783551430947
+Pseudomonas aeruginosa	0.0890278042735527
+Bacillus subtilis	0.008902780427355268
+Saccharomyces cerevisiae	0.008902780427355268
+Escherichia coli	0.0008902780427355268
+Salmonella enterica	0.0008902780427355268
+Lactobacillus fermentum	0.00008902780427355268
+Enterococcus faecalis	0.000008902780427355268
+Cryptococcus neoformans	0.000008902780427355268
+Staphylococcus aureus	0.0000008902780427355268

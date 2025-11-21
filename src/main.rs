@@ -18,6 +18,9 @@ struct Args {
     #[arg(short, long)]
     out_path: std::path::PathBuf,
 
+    #[arg(long)]
+    hits_path: Option<std::path::PathBuf>,
+
     #[arg(short, long)]
     sam_path: std::path::PathBuf,
 
@@ -142,6 +145,7 @@ fn main() {
     sim.compute_telseq_distr(&mut probe_alignments);
     sim.sample_telseq(&mut output, &ref_seqs);
     sim.sample_background(&mut output, &ref_seqs);
-    sim.write_hits("/usr1/aidanz/projects/read_sim/data/sim_output/hits.txt");
-	// sim.simulate(args.split);
+    if let Some(hits_path) = args.hits_path {
+        sim.write_hits(hits_path.to_str().expect("Failed to convert hits path to string"));
+    }
 }
