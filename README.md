@@ -39,7 +39,8 @@ The compiled binary will be available at `target/release/read_sim`.
   --seqids sequence_mapping.txt \
   --temperature 60.0 \
   --nfrag 10000 \
-  --split 0.7
+  --split 0.7 \
+  --mult-file probe_mults.tsv
 ```
 
 This generates 10,000 fragments: 70% from probe-enriched targets, 30% from random background.
@@ -60,7 +61,7 @@ This generates 10,000 fragments: 70% from probe-enriched targets, 30% from rando
 | `--temperature` | `-t` | Hybridization temperature (°C) |
 | `--nfrag` | `-n` | Total number of fragments to generate |
 | `--split` | | Fraction of probe-enriched fragments (0.0-1.0) |
-| `--mult-file` | | None | Probe multiplicity file (tab-separated) |
+| `--mult-file` | `-p` | Probe multiplicity file (tab-separated) |
 
 #### Optional Arguments
 
