@@ -58,6 +58,7 @@ pub enum MismatchStrategy {
     SkipStacking,
 }
 
+#[allow(non_snake_case)]
 pub fn score_bam_alignment_multiT(
     record: &BamRecord,
     temp_c: f64,

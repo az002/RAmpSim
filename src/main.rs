@@ -31,7 +31,7 @@ struct Args {
     temperature: f64,
 
     #[arg(short, long="mult-file")]
-    probe_multiplicity: Option<std::path::PathBuf>,
+    probe_multiplicity: std::path::PathBuf,
 
     #[arg(long="seqids")]
     sequence_ids: std::path::PathBuf,
@@ -61,13 +61,12 @@ fn main() {
     let mut probe_alignments = SamReader::from_path(args.sam_path).unwrap();
     let mut output = BufWriter::new(File::create(args.out_path).expect("Failed to create output file"));
 
-    let probe_multiplicities: HashMap<String, usize> = match args.probe_multiplicity {
-        Some(path) => {
-            let file = File::open(path).expect("Failed to open probe multiplicity file");
-            let reader = std::io::BufReader::new(file);
-            let mut map = std::collections::HashMap::new();
-            for line in reader.lines() {
-                let line = line.expect("Failed to read line");
+    let probe_multiplicities: HashMap<String, usize> = {
+        let file = File::open(args.probe_multiplicity).expect("Failed to open probe multiplicity file");
+        let reader = std::io::BufReader::new(file);
+        let mut map = std::collections::HashMap::new();
+        for line in reader.lines() {
+            let line = line.expect("Failed to read line");
                 let parts: Vec<&str> = line.split('\t').collect();
                 if parts.len() == 2 {
                     let probe = parts[0].to_string();
@@ -76,9 +75,7 @@ fn main() {
                 }
             }
             map
-        },
-        None => std::collections::HashMap::new(),
-    };
+        };
 
     let abundances: HashMap<String, f64> = {
         let file = File::open(args.abundances).expect("Failed to open abundances file");
