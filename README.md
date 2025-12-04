@@ -60,6 +60,7 @@ This generates 10,000 fragments: 70% from probe-enriched targets, 30% from rando
 | `--temperature` | `-t` | Hybridization temperature (°C) |
 | `--nfrag` | `-n` | Total number of fragments to generate |
 | `--split` | | Fraction of probe-enriched fragments (0.0-1.0) |
+| `--mult-file` | | None | Probe multiplicity file (tab-separated) |
 
 #### Optional Arguments
 
@@ -67,7 +68,6 @@ This generates 10,000 fragments: 70% from probe-enriched targets, 30% from rando
 |----------|-------|---------|-------------|
 | `--flen` | `-l` | 8000 | Mean fragment length (bp) |
 | `--lognorm-sd` | | 0.4 | Standard deviation for log-normal distribution |
-| `--mult-file` | | None | Probe multiplicity file (tab-separated) |
 | `--hits-path` | | None | Output path for probe binding site scores |
 
 ### Input File Formats
@@ -117,7 +117,7 @@ NC_002516.2	P_aeruginosa
 
 Maps individual sequences (chromosomes, plasmids, contigs) to reference genomes.
 
-#### 5. Probe Multiplicity File (Optional, `--mult-file`)
+#### 5. Probe Multiplicity File (`--mult-file`)
 
 Tab-separated: probe_name → copy_number
 ```
