@@ -197,8 +197,7 @@ impl Simulator {
 
 			writeln!(
 				seq_input,
-				">Background|{}|{}|{}-{}\n{}",
-				self.seqid2refid.get(seq_id).unwrap(),
+				">Background|{}|{}-{}\n{}",
 				seq_id,
 				frag_start,
 				frag_end,
