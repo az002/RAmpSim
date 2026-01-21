@@ -59,6 +59,7 @@ This generates 10,000 fragments: 70% from probe-enriched targets, 30% from rando
 | `--abundances` | `-a` | Tab-separated file with reference abundances |
 | `--seqids` | | Mapping of sequence IDs to reference IDs |
 | `--temperature` | `-t` | Hybridization temperature (°C) |
+| `--mult-file` | `-p` | Probe multiplicity file (tab-separated) |
 | `--nfrag` | `-n` | Total number of fragments to generate |
 | `--split` | | Fraction of probe-enriched fragments (0.0-1.0) |
 | `--mult-file` | `-p` | Probe multiplicity file (tab-separated) |
@@ -174,10 +175,19 @@ Real-time fragment generation log:
 
 Format: `[TYPE]:reference_id:sequence_id:start-end:probe_name`
 
+## Data Sources
+
+### TELSeq Datasets
+
+TELSeq sequencing data is available from NCBI BioProject [PRJNA751055](https://www.ncbi.nlm.nih.gov/bioproject/PRJNA751055).
+
+### Reference Genomes
+
 ## Examples
 
-Example files are provided in the examples directory. Download reference genomes with
-```
+Example files are provided in the examples directory. Download reference genomes with:
+
+```bash
 wget https://s3.amazonaws.com/zymo-files/BioPool/ZymoBIOMICS.STD.refseq.v2.zip
 unzip ZymoBIOMICS.STD.refseq.v2.zip
 cat ZymoBIOMICS.STD.refseq.v2/Genomes/*.fasta > references.fa
