@@ -143,6 +143,6 @@ fn main() {
     sim.sample_telseq(&mut output, &ref_seqs);
     sim.sample_background(&mut output, &ref_seqs);
     if let Some(hits_path) = args.hits_path {
-        sim.write_hits(hits_path.to_str().expect("Failed to convert hits path to string"));
+        sim.write_hits(hits_path);
     }
 }

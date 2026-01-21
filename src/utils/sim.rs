@@ -21,6 +21,7 @@ pub struct Simulator {
     fragment_len: usize,
 	lognorm_sd: f64,
 	nfragments: usize,
+	sampled: usize,
 	split: f64,
 	temperature: f64,
 	probe_multiplicities: HashMap<String, usize>,
@@ -44,6 +45,7 @@ impl Simulator {
 			fragment_len,
 			lognorm_sd,
 			nfragments,
+			sampled: 0,
 			split,
 			temperature,
 			probe_multiplicities,
@@ -84,14 +86,27 @@ impl Simulator {
 	}
 
 	pub fn sample_telseq(&mut self, seqinput: &mut BufWriter<File>, ref_seqs : &HashMap<String, String>) {
-		let probs: Vec<f64> = self.probe_multiplicities.iter()
-			.filter(|(k, _)| self.hits.contains_key(*k))
-			.map(|(_, v)| *v as f64)
-			.collect();
-		let probe_names: Vec<String> = self.probe_multiplicities.keys()
-			.filter(|k| self.hits.contains_key(*k))
-			.cloned()
-			.collect();
+		// If probe_multiplicities is empty, use uniform distribution over all probes with hits
+		let (probs, probe_names): (Vec<f64>, Vec<String>) = if self.probe_multiplicities.is_empty() {
+			let names: Vec<String> = self.hits.keys().cloned().collect();
+			let uniform_probs: Vec<f64> = vec![1.0; names.len()];
+			(uniform_probs, names)
+		} else {
+			let probs: Vec<f64> = self.probe_multiplicities.iter()
+				.filter(|(k, _)| self.hits.contains_key(*k))
+				.map(|(_, v)| *v as f64)
+				.collect();
+			let names: Vec<String> = self.probe_multiplicities.keys()
+				.filter(|k| self.hits.contains_key(*k))
+				.cloned()
+				.collect();
+			(probs, names)
+		};
+
+		if probs.is_empty() {
+			eprintln!("Warning: No probes with hits found. Skipping telseq sampling.");
+			return;
+		}
 
 		let mut rng = rand::rng();
 		let multinomial = rand::distr::weighted::WeightedIndex::new(&probs).unwrap();
@@ -133,6 +148,7 @@ impl Simulator {
 					).expect("Error writing to output");
 
 					println!("[TELSEQ]:{}:{}:{}-{}:{}",self.seqid2refid.get(&hit.seq_id).unwrap(), hit.seq_id, frag_start, frag_end, probe_name);
+					self.sampled += 1;
 				}
 			}
 		}
@@ -144,49 +160,56 @@ impl Simulator {
 		seq_input: &mut BufWriter<File>,
 		ref_seqs : &HashMap<String, String>
 	) {
-		let n = (self.nfragments as f64 * (1.0 - self.split)) as usize;
-		eprintln!("Sampling {} background fragments", n);
-		let mut refid2seqid: HashMap<String, Vec<String>> = HashMap::new();
-		
+		let n_remain = self.nfragments - self.sampled;
+		eprintln!("Sampling {} background fragments", n_remain);
+
+		let mut seq_list: Vec<&String> = Vec::new();
+		let mut weights: Vec<f64> = Vec::new();
+
 		for (seq_id, ref_id) in &self.seqid2refid {
-			refid2seqid.entry(ref_id.clone()).or_insert_with(Vec::new).push(seq_id.clone());
-		}
-
-		let lognorm = LogNormal::new((self.fragment_len as f64).ln(), self.lognorm_sd).unwrap();
-		let mut rng = rand::rng();
-
-		for (ref_id, seq_ids) in &refid2seqid {
-			let abundance = *self.abundances.get(ref_id).unwrap_or(&0.0);
-			let nfrags = (abundance * n as f64) as usize;
-			if nfrags > 0 {
-				let total_length: usize = seq_ids.iter()
-					.filter_map(|seq_id| ref_seqs.get(seq_id).map(|s| s.len()))
-					.sum();
-				for seq_id in seq_ids {
-					if let Some(seq) = ref_seqs.get(seq_id) {
-						let n = seq.len() * nfrags / total_length;
-						for _ in 0..n {
-							let frag_len = lognorm.sample(&mut rng) as usize;
-							let frag_start = rng.random_range(0..seq.len()-frag_len);
-							let frag_end = cmp::min(frag_start + frag_len, seq.len());
-							writeln!(
-								seq_input,
-								">Background|{}|{}-{}\n{}",
-								seq_id,
-								frag_start,
-								frag_end,
-								&seq[frag_start..frag_end]
-							).unwrap();
-
-							println!("[BG]:{}:{}:{}-{}:", self.seqid2refid.get(seq_id).unwrap(), seq_id, frag_start, frag_end);
-						}
-					}
+			if let Some(seq) = ref_seqs.get(seq_id) {
+				let abundance = *self.abundances.get(ref_id).unwrap_or(&0.0);
+				let weight = abundance * seq.len() as f64;
+				if weight > 0.0 {
+					seq_list.push(seq_id);
+					weights.push(weight);
 				}
 			}
 		}
+
+		if weights.is_empty() {
+			eprintln!("Warning: No valid sequences for background sampling.");
+			return;
+		}
+
+		let dist = rand::distr::weighted::WeightedIndex::new(&weights).unwrap();
+		let lognorm = LogNormal::new((self.fragment_len as f64).ln(), self.lognorm_sd).unwrap();
+		let mut rng = rand::rng();
+
+		for _ in 0..n_remain {
+			let idx = dist.sample(&mut rng);
+			let seq_id = seq_list[idx];
+			let seq = ref_seqs.get(seq_id).unwrap();
+
+			let frag_len = cmp::min(lognorm.sample(&mut rng) as usize, seq.len());
+			let frag_start = rng.random_range(0..=seq.len() - frag_len);
+			let frag_end = frag_start + frag_len;
+
+			writeln!(
+				seq_input,
+				">Background|{}|{}|{}-{}\n{}",
+				self.seqid2refid.get(seq_id).unwrap(),
+				seq_id,
+				frag_start,
+				frag_end,
+				&seq[frag_start..frag_end]
+			).unwrap();
+
+			println!("[BG]:{}:{}:{}-{}:", self.seqid2refid.get(seq_id).unwrap(), seq_id, frag_start, frag_end);
+		}
 	}
 
-	pub fn write_hits(&self, path: &str) {
+	pub fn write_hits(&self, path: std::path::PathBuf) {
 		let mut file = File::create(path).expect("Failed to create hits file");
 		for (probe, hits) in &self.hits {
 			let total_score: f64 = hits.iter().map(|h| h.score).sum();
