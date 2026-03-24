@@ -181,6 +181,8 @@ Format: `[TYPE]:reference_id:sequence_id:start-end:probe_name`
 
 TELSeq sequencing data is available from NCBI BioProject [PRJNA751055](https://www.ncbi.nlm.nih.gov/bioproject/PRJNA751055).
 
+Human gut microbiome data is available [here](https://drive.google.com/drive/folders/1qc2Zi9hEMOLBf5c5KhbsbSHntzUsss9w?usp=sharing). This will be updated to a permanent public accession once available.
+
 ### Reference Genomes
 
 ## Examples
